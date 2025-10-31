@@ -1,139 +1,173 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/material.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'attendance_form.dart';
-import 'firebase_options.dart'; // auto-created when you run flutterfire configure
+import 'firebase_options.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/data/latest.dart' as tz;
+import 'package:timezone/timezone.dart' as tz;
+
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+FlutterLocalNotificationsPlugin();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
-  // await FirebaseAppCheck.instance.activate(
-  //   androidProvider: AndroidProvider.debug,
-  //   appleProvider: AppleProvider.debug,
-  // );
+
+  // Optionally enable Firebase App Check (for production security)
+  await FirebaseAppCheck.instance.activate();
+
   runApp(MyApp());
+  //await scheduleTestNotification();
 }
-Future<void> _checkForAppUpdate(BuildContext context) async {
-  try {
-    // Get current app version
-    final info = await PackageInfo.fromPlatform();
-    final currentVersion = info.version;
-    print("currentVersion " + currentVersion);
-    // Get latest version from Firestore
-    final doc = await FirebaseFirestore.instance
-        .collection('app_config')
-        .doc('version_info')
-        .get();
+Future<void> scheduleTestNotification() async {
+  const androidDetails = AndroidNotificationDetails(
+    'attendance_reminder_channel',
+    'Attendance Reminder',
+    channelDescription: 'Daily reminder to mark attendance at 10 AM',
+    importance: Importance.max,
+    priority: Priority.high,
+  );
+  const details = NotificationDetails(android: androidDetails);
 
-    if (!doc.exists) return;
+  final now = tz.TZDateTime.now(tz.local);
+  final reminderTime = now.add(const Duration(minutes: 2));
 
-    final latestVersion = doc['latest_version'];
-    final apkUrl = doc['apk_url'];
-    final message = doc['message'] ?? "A new update is available.";
+  print("Scheduling notification at $reminderTime");
 
-    if (_isNewVersionAvailable(currentVersion, latestVersion)) {
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => AlertDialog(
-          title: const Text("🚀 Update Required"),
-          content: Text(message),
-          actions: [
-            TextButton(
-              onPressed: () async {
-                final Uri url = Uri.parse(apkUrl);
-                if (await canLaunchUrl(url)) {
-                  await launchUrl(url, mode: LaunchMode.externalApplication);
-                }
-              },
-              child: const Text("Download Update"),
-            ),
-          ],
-        ),
-      );
-    }
-  } catch (e) {
-    print("Error checking for app update: $e");
-  }
+  await flutterLocalNotificationsPlugin.zonedSchedule(
+    0,
+    'Attendance Reminder',
+    'Please mark your attendance 📸',
+    reminderTime,
+    details,
+    androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+    uiLocalNotificationDateInterpretation:
+    UILocalNotificationDateInterpretation.absoluteTime,
+    matchDateTimeComponents: DateTimeComponents.time,
+  );
 }
 
-bool _isNewVersionAvailable(String current, String latest) {
-  final curr = current.split('.').map(int.parse).toList();
-  final lat = latest.split('.').map(int.parse).toList();
-
-  for (int i = 0; i < curr.length; i++) {
-    if (lat[i] > curr[i]) return true;
-    if (lat[i] < curr[i]) return false;
-  }
-  return false;
-}
 class MyApp extends StatelessWidget {
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    /*return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: AttendanceForm(),
-    );*/
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      title: 'Attendance Tracker',
       home: StreamBuilder<User?>(
         stream: FirebaseAuth.instance.authStateChanges(),
         builder: (context, snapshot) {
-          //_checkForAppUpdate(context);
           if (snapshot.connectionState == ConnectionState.waiting) {
-            return Scaffold(body: Center(child: CircularProgressIndicator()));
+            return const Scaffold(
+                body: Center(child: CircularProgressIndicator()));
           }
           if (snapshot.hasData) {
-            return AttendanceApp(); // ✅ Already logged in
+            // Schedule the daily 10AM reminder once user is logged in
+            //scheduleDailyAttendanceReminder();
+            /* test notification */
+             /*flutterLocalNotificationsPlugin.show(
+              1,
+              'Test Notification',
+              'If you see this, notifications work!',
+              const NotificationDetails(
+                android: AndroidNotificationDetails(
+                  'test_channel',
+                  'Test Channel',
+                  importance: Importance.max,
+                  priority: Priority.high,
+                ),
+              ),
+            );*/
+
+            return const AttendanceApp();
           }
-          return AuthPage();   // 🔑 Login/Signup
+          return AuthPage();
         },
       ),
     );
   }
 }
 
+/// 🕙 Schedules a daily reminder notification at 10 AM
+Future<void> scheduleDailyAttendanceReminder() async {
+  tz.initializeTimeZones();
+  tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
+  print("harshita scheduleDailyAttendanceReminder");
+
+  const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+  const iosInit = DarwinInitializationSettings();
+  const initSettings = InitializationSettings(android: androidInit, iOS: iosInit);
+  await flutterLocalNotificationsPlugin.initialize(initSettings);
+  final androidPlugin = flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<
+      AndroidFlutterLocalNotificationsPlugin>();
+  await androidPlugin?.requestNotificationsPermission();
+
+  const androidDetails = AndroidNotificationDetails(
+    'attendance_reminder_channel',
+    'Attendance Reminder',
+    channelDescription: 'Daily reminder to mark attendance at 10 AM',
+    importance: Importance.max,
+    priority: Priority.high,
+  );
+  const details = NotificationDetails(android: androidDetails);
+
+  final now = tz.TZDateTime.now(tz.local);
+  final reminderTime = tz.TZDateTime(
+    tz.local,
+    now.year,
+    now.month,
+    now.day,
+    now.hour,
+    now.minute + 2,
+    0
+  );
+  //final nextReminder = reminderTime.isBefore(now) ? reminderTime.add(const Duration(days: 1)) : reminderTime;
+  //final nextReminder = now.add(const Duration(minutes: 3));
+  print("harshita zonedSchedule call");
+  await flutterLocalNotificationsPlugin.zonedSchedule(
+    0,
+    'Attendance Reminder',
+    'Please mark your attendance for today 📸',
+    reminderTime,
+    details,
+    androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+    matchDateTimeComponents: DateTimeComponents.time,
+    uiLocalNotificationDateInterpretation:
+    UILocalNotificationDateInterpretation.absoluteTime,
+  );
+}
+
+/// 🧾 Attendance screen wrapper
 class AttendanceApp extends StatelessWidget {
   const AttendanceApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final user = FirebaseAuth.instance.currentUser;
-   /* return MaterialApp(
-      debugShowCheckedModeBanner: false,
-
-      home: AttendanceForm(),
-
-    );*/
-    return Scaffold(
-    /*  appBar: AppBar(
-        title: Text("Home Page"),
-        actions: [
-          IconButton(
-            icon: Icon(Icons.logout),
-            onPressed: () => FirebaseAuth.instance.signOut(),
-          )
-        ],
-      ),*/
+    return const Scaffold(
       body: AttendanceForm(),
-     /* body: Center(
-        child: Text("Welcome, ${user?.email}! 🎉"),
-      ),*/
     );
   }
 }
 
+/// 🧍 Authentication page (your existing AuthPage)
 class AuthPage extends StatefulWidget {
+  const AuthPage({super.key});
   @override
   _AuthPageState createState() => _AuthPageState();
 }
+
+// Keep your existing AuthPage code as-is below...
+
 
 class _AuthPageState extends State<AuthPage> {
   final _emailController = TextEditingController();

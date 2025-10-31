@@ -9,6 +9,9 @@ import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 
+import 'attendance_history_screen.dart';
+import 'leave_screen.dart';
+
 class AttendanceForm extends StatefulWidget {
   const AttendanceForm({super.key});
 
@@ -17,7 +20,6 @@ class AttendanceForm extends StatefulWidget {
 }
 
 class _AttendanceFormState extends State<AttendanceForm> {
-  File? _image;
   File? _punchInImage;
   File? _punchOutImage;
   String _punchInAddress = "";
@@ -29,6 +31,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
   bool _alreadySubmitted = false;
   DateTime? _submittedTime; // Punch In
   DateTime? _punchOutTime; // Punch Out
+  bool _isLate = false;
+  String _totalHours = "";
+  bool _exemptionRequested = false;
 
   // ---------------- Helper Methods ----------------
 
@@ -77,7 +82,6 @@ class _AttendanceFormState extends State<AttendanceForm> {
       _position = pos;
     });
     address = await getAddressFromLatLng(_position!);
-    print("harshita test address" + address);
   }
 
   Future<String> getAddressFromLatLng(Position position) async {
@@ -89,8 +93,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
       if (placemarks.isNotEmpty) {
         final place = placemarks.first;
-        return "${place.name}, ${place.street}, ${place.subLocality}, ${place.locality}, ${place.subAdministrativeArea}"
-            " ${place.administrativeArea}, ${place.subThoroughfare}, ${place.postalCode}, ${place.country}";
+        return "${place.name}, ${place.street}, ${place.locality}, ${place.administrativeArea}, ${place.postalCode}, ${place.country}";
       } else {
         return "Address not found";
       }
@@ -106,7 +109,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
     var result = await FlutterImageCompress.compressAndGetFile(
       file.absolute.path,
       targetPath,
-      quality: 40,
+      quality: 60,
       format: CompressFormat.jpeg,
     );
 
@@ -131,16 +134,51 @@ class _AttendanceFormState extends State<AttendanceForm> {
         _punchOutTime = data["punchOutTime"] != null
             ? (data["punchOutTime"] as Timestamp).toDate()
             : null;
+        _isLate = data["isLate"] ?? false;
+        if (data["totalHours"] != null) {
+          int mins = data["totalHours"];
+          _totalHours = "${mins ~/ 60}h ${mins % 60}m";
+        }
+      });
+    }
+  }
+  Future<void> _checkExemptionStatus() async {
+    if (user == null) return;
+
+    final today = DateTime.now();
+    final todayDate = DateTime(today.year, today.month, today.day);
+
+    final exemptionSnap = await FirebaseFirestore.instance
+        .collection("exemptions")
+        .where("userId", isEqualTo: user!.uid)
+        .where("date", isGreaterThanOrEqualTo: Timestamp.fromDate(todayDate))
+        .where("date", isLessThan: Timestamp.fromDate(todayDate.add(const Duration(days: 1))))
+        .get();
+
+    if (exemptionSnap.docs.isNotEmpty) {
+      setState(() {
+        _exemptionRequested = true;
       });
     }
   }
 
+
   Future<void> _submitAttendance() async {
-    if (_punchInImage  == null || _position == null) {
+    if (_punchInImage == null || _position == null) {
       ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Please take selfie & location")));
       return;
     }
+
+    DateTime now = DateTime.now();
+    DateTime allowedTime = DateTime(now.year, now.month, now.day, 9, 0);
+    if (now.isBefore(allowedTime)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Punch In allowed only after 9:00 AM")),
+      );
+      return;
+    }
+
 
     setState(() => _loading = true);
 
@@ -155,18 +193,25 @@ class _AttendanceFormState extends State<AttendanceForm> {
       await ref.putFile(file);
       final selfieUrl = await ref.getDownloadURL();
 
+      DateTime now = DateTime.now();
+      DateTime cutoff = DateTime(now.year, now.month, now.day, 10, 15);
+      bool isLate = now.isAfter(cutoff);
+
       await FirebaseFirestore.instance.collection("attendance").add({
         "userId": user?.uid,
         "punchInLatitude": _position!.latitude,
         "punchInLongitude": _position!.longitude,
-        "punchInTime": DateTime.now(),
-        "punchInDate": DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day),
+        "punchInAddress": _punchInAddress,
+        "punchInTime": now,
+        "punchInDate": DateTime(now.year, now.month, now.day),
         "punchInSelfieUrl": selfieUrl,
+        "isLate": isLate,
       });
 
       setState(() {
-        _submittedTime = DateTime.now();
+        _submittedTime = now;
         _alreadySubmitted = true;
+        _isLate = isLate;
       });
 
       ScaffoldMessenger.of(context).showSnackBar(
@@ -180,7 +225,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
   }
 
   Future<void> _punchOut() async {
-    if (_punchOutImage  == null || _position == null) {
+    if (_punchOutImage == null || _position == null) {
       ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Please take selfie & location")));
       return;
@@ -189,7 +234,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
     setState(() => _loading = true);
 
     try {
-      final compressedSelfie = await compressImage(_punchOutImage !);
+      final compressedSelfie = await compressImage(_punchOutImage!);
       if (compressedSelfie == null) throw Exception("Image compression failed");
 
       final ref = FirebaseStorage.instance
@@ -199,7 +244,6 @@ class _AttendanceFormState extends State<AttendanceForm> {
       await ref.putFile(file);
       final selfieUrl = await ref.getDownloadURL();
 
-      // Update today's attendance document with punchOut
       final today = DateTime.now();
       final todayDate = DateTime(today.year, today.month, today.day);
 
@@ -210,18 +254,24 @@ class _AttendanceFormState extends State<AttendanceForm> {
           .get();
 
       if (snap.docs.isNotEmpty) {
+        DateTime punchOutTime = DateTime.now();
+        Duration totalHours = punchOutTime.difference(_submittedTime!);
+
         await FirebaseFirestore.instance
             .collection("attendance")
             .doc(snap.docs.first.id)
             .update({
-          "punchOutTime": DateTime.now(),
+          "punchOutTime": punchOutTime,
           "punchOutSelfieUrl": selfieUrl,
           "punchOutLatitude": _position!.latitude,
           "punchOutLongitude": _position!.longitude,
+          "punchOutAddress": _punchOutAddress,
+          "totalHours": totalHours.inMinutes,
         });
 
         setState(() {
-          _punchOutTime = DateTime.now();
+          _punchOutTime = punchOutTime;
+          _totalHours = "${totalHours.inHours}h ${totalHours.inMinutes % 60}m";
         });
 
         ScaffoldMessenger.of(context).showSnackBar(
@@ -234,6 +284,45 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
     setState(() => _loading = false);
   }
+
+  Future<void> _requestExemption() async {
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null || _submittedTime == null || _punchOutTime == null) return;
+
+      final duration = _punchOutTime!.difference(_submittedTime!);
+      final hours = duration.inHours;
+      final minutes = duration.inMinutes.remainder(60);
+      final totalHours = "$hours h $minutes m";
+
+      await FirebaseFirestore.instance.collection('exemptions').add({
+        'userId': user.uid,
+        'date': Timestamp.fromDate(DateTime(
+          _submittedTime!.year,
+          _submittedTime!.month,
+          _submittedTime!.day,
+        )),
+        'totalHours': totalHours,
+        'reason': 'Worked less than 9 hours',
+        'status': 'Pending',
+        'requestedAt': Timestamp.now(),
+      });
+
+      setState(() {
+        _exemptionRequested = true; // new state variable
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Exemption request sent to Admin ✅')),
+      );
+    } catch (e) {
+      print("Error submitting exemption: $e");
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    }
+  }
+
 
   Future<void> _applyLeave() async {
     DateTimeRange? selectedRange = await showDateRangePicker(
@@ -310,6 +399,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
   void initState() {
     super.initState();
     _checkAttendance();
+    _checkExemptionStatus();
   }
 
   // ------------------- Build UI -------------------
@@ -320,34 +410,64 @@ class _AttendanceFormState extends State<AttendanceForm> {
       future: _getUserName(),
       builder: (context, snapshot) {
         String title = "Attendance Monitoring System";
-        if (snapshot.connectionState == ConnectionState.done &&
-            snapshot.hasData) {
+        if (snapshot.connectionState == ConnectionState.done && snapshot.hasData) {
           title = "Welcome ${snapshot.data}";
         }
 
         return Scaffold(
           appBar: AppBar(
-            title: Text(title,
-                style: const TextStyle(fontWeight: FontWeight.bold)),
-            centerTitle: false,
+            title: Text(title, style: const TextStyle(fontWeight: FontWeight.w400)),
             backgroundColor: Colors.orangeAccent,
-            elevation: 2,
-            shape: const Border(
-              bottom: BorderSide(color: Colors.black, width: 1),
+          ),
+          drawer: Drawer(
+            child: ListView(
+              padding: EdgeInsets.zero,
+              children: [
+                UserAccountsDrawerHeader(
+                  decoration: const BoxDecoration(color: Colors.orangeAccent),
+                  accountName: Text(snapshot.data ?? "User"),
+                  accountEmail: Text(FirebaseAuth.instance.currentUser?.email ?? ""),
+                  currentAccountPicture: const CircleAvatar(
+                    backgroundColor: Colors.white,
+                    child: Icon(Icons.person, size: 40, color: Colors.orange),
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.calendar_month, color: Colors.orange),
+                  title: const Text("Leave Requests"),
+                  onTap: () {
+                    Navigator.pop(context);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => const LeaveScreen()),
+                    );
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.history, color: Colors.orange),
+                  title: const Text("Attendance History"),
+                  onTap: () {
+                    Navigator.pop(context);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => const AttendanceHistoryScreen()),
+                    );
+                  },
+                ),
+                const Divider(),
+                ListTile(
+                  leading: const Icon(Icons.logout, color: Colors.red),
+                  title: const Text("Logout"),
+                  onTap: () => FirebaseAuth.instance.signOut(),
+                ),
+              ],
             ),
-            actions: [
-              IconButton(
-                icon: const Icon(Icons.logout),
-                onPressed: () => FirebaseAuth.instance.signOut(),
-              )
-            ],
           ),
           body: SingleChildScrollView(
             padding: const EdgeInsets.all(16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // ----------------- Attendance Card -----------------
                 Card(
                   elevation: 3,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -369,12 +489,14 @@ class _AttendanceFormState extends State<AttendanceForm> {
                               _submittedTime != null
                                   ? "Punch In: ${DateFormat('dd MMM, hh:mm a').format(_submittedTime!)}"
                                   : "Punch In: Not yet",
-                              style: const TextStyle(fontSize: 14),
                             ),
                           ],
                         ),
 
-                        // Punch In selfie & address
+                        if (_isLate)
+                          const Text("⚠️ Late Punch In", style: TextStyle(color: Colors.red)),
+
+                        // Punch In Image & Address
                         if (_punchInImage != null)
                           Column(
                             children: [
@@ -385,11 +507,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
                               ),
                               const SizedBox(height: 4),
                               if (_punchInAddress.isNotEmpty)
-                                Text(
-                                  "📍 Address: $_punchInAddress",
-                                  style: const TextStyle(fontSize: 12, color: Colors.grey),
-                                  textAlign: TextAlign.center,
-                                ),
+                                Text("📍 Address: $_punchInAddress",
+                                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                                    textAlign: TextAlign.center),
                             ],
                           ),
 
@@ -404,12 +524,47 @@ class _AttendanceFormState extends State<AttendanceForm> {
                               _punchOutTime != null
                                   ? "Punch Out: ${DateFormat('dd MMM, hh:mm a').format(_punchOutTime!)}"
                                   : "Punch Out: Not yet",
-                              style: const TextStyle(fontSize: 14),
                             ),
                           ],
                         ),
 
-                        // Punch Out selfie & address
+                        // ✅ Calculate total working hours
+                        Builder(builder: (context) {
+                          if (_submittedTime != null && _punchOutTime != null) {
+                            final duration = _punchOutTime!.difference(_submittedTime!);
+                            final hours = duration.inHours;
+                            final minutes = duration.inMinutes.remainder(60);
+                            final totalHours = "$hours h $minutes m";
+
+                            bool showExemption = hours < 9;
+
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const SizedBox(height: 8),
+                                Text("Total Hours: $totalHours",
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold, fontSize: 15)),
+                                if (showExemption && !_exemptionRequested)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 8),
+                                    child: ElevatedButton.icon(
+                                      onPressed: _requestExemption,
+                                      icon: const Icon(Icons.report_problem),
+                                      label: const Text("Seek Exemption"),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.orange,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            );
+                          } else {
+                            return const SizedBox.shrink();
+                          }
+                        }),
+
+                        // Punch Out Image & Address
                         if (_punchOutImage != null)
                           Column(
                             children: [
@@ -420,11 +575,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
                               ),
                               const SizedBox(height: 4),
                               if (_punchOutAddress.isNotEmpty)
-                                Text(
-                                  "📍 Address: $_punchOutAddress",
-                                  style: const TextStyle(fontSize: 12, color: Colors.grey),
-                                  textAlign: TextAlign.center,
-                                ),
+                                Text("📍 Address: $_punchOutAddress",
+                                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                                    textAlign: TextAlign.center),
                             ],
                           ),
 
@@ -473,92 +626,11 @@ class _AttendanceFormState extends State<AttendanceForm> {
                     ),
                   ),
                 ),
-                const SizedBox(height: 20),
-
-                // ----------------- Leave Card -----------------
-                Card(
-                  elevation: 3,
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          "Leaves",
-                          style: TextStyle(
-                              fontSize: 18, fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 12),
-                        SizedBox(
-                          width: double.infinity,
-                          child: ElevatedButton.icon(
-                            onPressed: _applyLeave,
-                            icon: const Icon(Icons.calendar_month),
-                            label: const Text("Apply Leave"),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.orangeAccent,
-                              padding: const EdgeInsets.symmetric(vertical: 12),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                        StreamBuilder<QuerySnapshot>(
-                          stream: FirebaseFirestore.instance
-                              .collection("leaves")
-                              .where("userId",
-                              isEqualTo: FirebaseAuth
-                                  .instance.currentUser?.uid)
-                              .orderBy("startDate", descending: false)
-                              .snapshots(),
-                          builder: (context, snapshot) {
-                            if (!snapshot.hasData) return const SizedBox();
-                            if (snapshot.data!.docs.isEmpty) {
-                              return const Text("No leaves applied yet.");
-                            }
-
-                            return Column(
-                              children: snapshot.data!.docs.map((doc) {
-                                final data =
-                                doc.data() as Map<String, dynamic>;
-                                final start =
-                                (data["startDate"] as Timestamp).toDate();
-                                final end =
-                                (data["endDate"] as Timestamp).toDate();
-                                final status = data["status"] ?? "Pending";
-
-                                Color statusColor = Colors.orange;
-                                if (status.toLowerCase() == "approved") {
-                                  statusColor = Colors.green;
-                                } else if (status.toLowerCase() == "rejected") {
-                                  statusColor = Colors.red;
-                                }
-
-                                return ListTile(
-                                  leading: const Icon(Icons.event_note),
-                                  title: Text(
-                                    start == end
-                                        ? "${start.day}-${start.month}-${start.year}"
-                                        : "${start.day}-${start.month}-${start.year} to ${end.day}-${end.month}-${end.year}",
-                                  ),
-                                  subtitle: Text(
-                                    "Status: $status",
-                                    style: TextStyle(color: statusColor),
-                                  ),
-                                );
-                              }).toList(),
-                            );
-                          },
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
               ],
             ),
           ),
         );
+
       },
     );
   }
