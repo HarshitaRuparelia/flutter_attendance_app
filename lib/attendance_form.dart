@@ -34,6 +34,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
   bool _isLate = false;
   String _totalHours = "";
   bool _exemptionRequested = false;
+  bool _noPunchInNeeded = false;
 
   // ---------------- Helper Methods ----------------
 
@@ -50,6 +51,49 @@ class _AttendanceFormState extends State<AttendanceForm> {
       return "User";
     }
   }
+  Future<void> _checkNoPunchInDay() async {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+
+    // 1️⃣ Sunday
+    if (now.weekday == DateTime.sunday) {
+      setState(() => _noPunchInNeeded = true);
+      return;
+    }
+
+    // 2️⃣ 2nd or 4th Saturday
+    if (now.weekday == DateTime.saturday) {
+      // Find which Saturday it is (1-based)
+      final firstDayOfMonth = DateTime(now.year, now.month, 1);
+      int saturdayCount = 0;
+      for (int d = 1; d <= now.day; d++) {
+        DateTime checkDay = DateTime(now.year, now.month, d);
+        if (checkDay.weekday == DateTime.saturday) {
+          saturdayCount++;
+        }
+      }
+      if (saturdayCount == 2 || saturdayCount == 4) {
+        setState(() => _noPunchInNeeded = true);
+        return;
+      }
+    }
+
+    // 3️⃣ Leave applied for today
+    if (user != null) {
+      final leaveSnap = await FirebaseFirestore.instance
+          .collection("leaves")
+          .where("userId", isEqualTo: user!.uid)
+          .where("startDate", isLessThanOrEqualTo: today)
+          .where("endDate", isGreaterThanOrEqualTo: today)
+          .get();
+
+      if (leaveSnap.docs.isNotEmpty) {
+        setState(() => _noPunchInNeeded = true);
+        return;
+      }
+    }
+  }
+
 
   Future<void> _captureSelfie({required bool isPunchOut}) async {
     final picker = ImagePicker();
@@ -128,6 +172,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
     if (snap.docs.isNotEmpty) {
       final data = snap.docs.first.data();
+      if (!mounted) return;
       setState(() {
         _alreadySubmitted = true;
         _submittedTime = (data["punchInTime"] as Timestamp).toDate();
@@ -139,6 +184,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
           int mins = data["totalHours"];
           _totalHours = "${mins ~/ 60}h ${mins % 60}m";
         }
+        _exemptionRequested = (data["exemptionStatus"] == "requested" || data["exemptionStatus"] == "approved");
       });
     }
   }
@@ -290,108 +336,32 @@ class _AttendanceFormState extends State<AttendanceForm> {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null || _submittedTime == null || _punchOutTime == null) return;
 
-      final duration = _punchOutTime!.difference(_submittedTime!);
-      final hours = duration.inHours;
-      final minutes = duration.inMinutes.remainder(60);
-      final totalHours = "$hours h $minutes m";
+      final todayDate = DateTime(_submittedTime!.year, _submittedTime!.month, _submittedTime!.day);
 
-      await FirebaseFirestore.instance.collection('exemptions').add({
-        'userId': user.uid,
-        'date': Timestamp.fromDate(DateTime(
-          _submittedTime!.year,
-          _submittedTime!.month,
-          _submittedTime!.day,
-        )),
-        'totalHours': totalHours,
-        'reason': 'Worked less than 9 hours',
-        'status': 'Pending',
-        'requestedAt': Timestamp.now(),
+      final attendanceSnap = await FirebaseFirestore.instance
+          .collection("attendance")
+          .where("userId", isEqualTo: user.uid)
+          .where("punchInDate", isEqualTo: todayDate)
+          .limit(1)
+          .get();
+
+      if (attendanceSnap.docs.isEmpty) return;
+      final docId = attendanceSnap.docs.first.id;
+
+      await FirebaseFirestore.instance.collection("attendance").doc(docId).update({
+        "exemptionStatus": "requested",
+        "exemptionRequestedAt": Timestamp.now(),
       });
 
       setState(() {
-        _exemptionRequested = true; // new state variable
+        _exemptionRequested = true;
       });
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Exemption request sent to Admin ✅')),
       );
     } catch (e) {
-      print("Error submitting exemption: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e')),
-      );
-    }
-  }
-
-
-  Future<void> _applyLeave() async {
-    DateTimeRange? selectedRange = await showDateRangePicker(
-      context: context,
-      firstDate: DateTime.now(),
-      lastDate: DateTime.now().add(const Duration(days: 90)),
-      initialDateRange: DateTimeRange(
-        start: DateTime.now(),
-        end: DateTime.now(),
-      ),
-      helpText: "Select leave date(s)",
-    );
-
-    if (selectedRange == null) return;
-
-    DateTime startDate = selectedRange.start;
-    DateTime endDate = selectedRange.end;
-
-    final userId = user?.uid;
-    if (userId == null) return;
-
-    try {
-      QuerySnapshot existing = await FirebaseFirestore.instance
-          .collection("leaves")
-          .where("userId", isEqualTo: userId)
-          .where("startDate", isLessThanOrEqualTo: endDate)
-          .where("endDate", isGreaterThanOrEqualTo: startDate)
-          .get();
-
-      if (existing.docs.isNotEmpty) {
-        var leave = existing.docs.first.data() as Map<String, dynamic>;
-        String status = leave["status"] ?? "Pending";
-        DateTime existingStart = (leave["startDate"] as Timestamp).toDate();
-        DateTime existingEnd = (leave["endDate"] as Timestamp).toDate();
-
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              "⚠️ You already applied leave from "
-                  "${existingStart.day}-${existingStart.month}-${existingStart.year} "
-                  "to ${existingEnd.day}-${existingEnd.month}-${existingEnd.year}\n"
-                  "Status: $status",
-            ),
-            duration: const Duration(seconds: 5),
-          ),
-        );
-        return;
-      }
-
-      await FirebaseFirestore.instance.collection("leaves").add({
-        "userId": userId,
-        "startDate": DateTime(startDate.year, startDate.month, startDate.day),
-        "endDate": DateTime(endDate.year, endDate.month, endDate.day),
-        "timestamp": DateTime.now(),
-        "status": "Pending",
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            startDate == endDate
-                ? "✅ Leave applied for ${startDate.day}-${startDate.month}-${startDate.year}"
-                : "✅ Leave applied from ${startDate.day}-${startDate.month}-${startDate.year} to ${endDate.day}-${endDate.month}-${endDate.year}",
-          ),
-        ),
-      );
-    } catch (e) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text("Error applying leave: $e")));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
     }
   }
 
@@ -400,6 +370,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
     super.initState();
     _checkAttendance();
     _checkExemptionStatus();
+    _checkNoPunchInDay();
   }
 
   // ------------------- Build UI -------------------
@@ -468,6 +439,33 @@ class _AttendanceFormState extends State<AttendanceForm> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                if (_noPunchInNeeded)
+                    Card(
+                      color: Colors.orange[100],
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10)),
+                      margin: const EdgeInsets.only(bottom: 16),
+                      child: const Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Row(
+                          children: [
+                            Icon(Icons.info_outline, color: Colors.orange),
+                            SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                "No Punch-In needed today",
+                                style: TextStyle(
+                                  color: Colors.orange,
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 16,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    )
+                else
                 Card(
                   elevation: 3,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -536,25 +534,94 @@ class _AttendanceFormState extends State<AttendanceForm> {
                             final minutes = duration.inMinutes.remainder(60);
                             final totalHours = "$hours h $minutes m";
 
-                            bool showExemption = hours < 9;
+                            bool isShortDay = hours < 9;
 
                             return Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 const SizedBox(height: 8),
-                                Text("Total Hours: $totalHours",
-                                    style: const TextStyle(
-                                        fontWeight: FontWeight.bold, fontSize: 15)),
-                                if (showExemption && !_exemptionRequested)
+                                Row(
+                                  children: [
+
+                                    Text("Total Hours: ",
+                                        style: TextStyle(
+                                          fontWeight: FontWeight.bold)),
+                                    if (isShortDay)
+                                      const Padding(
+                                        padding: EdgeInsets.only(left: 6),
+                                        child: Icon(Icons.access_time_filled, color: Colors.red, size: 18),
+                                      ),
+
+                                    Text(" $totalHours (Half Day)",
+                                        style: TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 15,
+                                          color: isShortDay ? Colors.red : Colors.black,
+                                        )),
+
+
+                                  ],
+                                ),
+                                if (isShortDay)
                                   Padding(
                                     padding: const EdgeInsets.only(top: 8),
-                                    child: ElevatedButton.icon(
-                                      onPressed: _requestExemption,
-                                      icon: const Icon(Icons.report_problem),
-                                      label: const Text("Seek Exemption"),
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor: Colors.orange,
-                                      ),
+                                    child: FutureBuilder<DocumentSnapshot?>(
+                                      future: () async {
+                                        final snap = await FirebaseFirestore.instance
+                                            .collection("attendance")
+                                            .where("userId", isEqualTo: user?.uid)
+                                            .where(
+                                          "punchInDate",
+                                          isEqualTo: DateTime(
+                                            _submittedTime!.year,
+                                            _submittedTime!.month,
+                                            _submittedTime!.day,
+                                          ),
+                                        )
+                                            .limit(1)
+                                            .get();
+
+                                        if (snap.docs.isNotEmpty) {
+                                          return await snap.docs.first.reference.get();
+                                        }
+                                        return null;
+                                      }(),
+                                      builder: (context, snapshot) {
+                                        if (!snapshot.hasData) {
+                                          return const SizedBox.shrink();
+                                        }
+
+                                        final doc = snapshot.data;
+                                        String exemptionStatus = "none";
+                                        if (doc != null && doc.exists && doc.data() != null) {
+                                          final data = doc.data() as Map<String, dynamic>;
+                                          exemptionStatus = data["exemptionStatus"] ?? "none";
+                                        }
+
+                                        String label = "Seek Exemption";
+                                        Color color = Colors.orange;
+                                        bool disabled = false;
+
+                                        if (exemptionStatus == "requested") {
+                                          label = "Exemption Requested";
+                                          color = Colors.grey;
+                                          disabled = true;
+                                        } else if (exemptionStatus == "approved") {
+                                          label = "Exempted ✅";
+                                          color = Colors.grey;
+                                          disabled = true;
+                                        }
+
+                                        return ElevatedButton.icon(
+                                          onPressed: disabled ? null : _requestExemption,
+                                          icon: const Icon(Icons.report_problem),
+                                          label: Text(label),
+                                          style: ElevatedButton.styleFrom(
+                                            backgroundColor: color,
+                                            disabledBackgroundColor: Colors.grey,
+                                          ),
+                                        );
+                                      },
                                     ),
                                   ),
                               ],

@@ -72,7 +72,7 @@ class MyApp extends StatelessWidget {
           }
           if (snapshot.hasData) {
             // Schedule the daily 10AM reminder once user is logged in
-            //scheduleDailyAttendanceReminder();
+            scheduleDailyAttendanceReminder();
             /* test notification */
              /*flutterLocalNotificationsPlugin.show(
               1,
@@ -101,12 +101,28 @@ class MyApp extends StatelessWidget {
 Future<void> scheduleDailyAttendanceReminder() async {
   tz.initializeTimeZones();
   tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
-  print("harshita scheduleDailyAttendanceReminder");
 
   const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
   const iosInit = DarwinInitializationSettings();
   const initSettings = InitializationSettings(android: androidInit, iOS: iosInit);
-  await flutterLocalNotificationsPlugin.initialize(initSettings);
+  await flutterLocalNotificationsPlugin.initialize(
+    initSettings,
+    onDidReceiveNotificationResponse: (NotificationResponse response) async {
+      if (response.actionId == 'DISMISS_ACTION') {
+        // User tapped "I'm Done"
+        debugPrint('✅ User dismissed the notification');
+
+        // Example: record this in Firestore or local DB
+        final uid = FirebaseAuth.instance.currentUser?.uid;
+        if (uid != null) {
+          await FirebaseFirestore.instance
+              .collection('users')
+              .doc(uid)
+              .update({'lastNotificationDismissed': FieldValue.serverTimestamp()});
+        }
+      }
+    },
+  );
   final androidPlugin = flutterLocalNotificationsPlugin
       .resolvePlatformSpecificImplementation<
       AndroidFlutterLocalNotificationsPlugin>();
@@ -118,22 +134,37 @@ Future<void> scheduleDailyAttendanceReminder() async {
     channelDescription: 'Daily reminder to mark attendance at 10 AM',
     importance: Importance.max,
     priority: Priority.high,
+    playSound: true,
+    enableVibration: true,
+    actions: <AndroidNotificationAction>[
+      AndroidNotificationAction(
+        'DISMISS_ACTION', // Unique action ID
+        'I’m Done ✅', // Button label
+        showsUserInterface: true,
+        cancelNotification: true, // removes the notification when tapped
+      ),
+    ],
   );
   const details = NotificationDetails(android: androidDetails);
 
   final now = tz.TZDateTime.now(tz.local);
-  final reminderTime = tz.TZDateTime(
+  var reminderTime = tz.TZDateTime(
     tz.local,
     now.year,
     now.month,
     now.day,
-    now.hour,
-    now.minute + 2,
+    10,
+   // now.hour,
+   // now.minute + 1,
     0
   );
+  if (reminderTime.isBefore(now)) {
+    reminderTime = reminderTime.add(const Duration(days: 1));
+  }
   //final nextReminder = reminderTime.isBefore(now) ? reminderTime.add(const Duration(days: 1)) : reminderTime;
   //final nextReminder = now.add(const Duration(minutes: 3));
-  print("harshita zonedSchedule call");
+  await flutterLocalNotificationsPlugin.cancelAll();
+
   await flutterLocalNotificationsPlugin.zonedSchedule(
     0,
     'Attendance Reminder',
@@ -141,7 +172,7 @@ Future<void> scheduleDailyAttendanceReminder() async {
     reminderTime,
     details,
     androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
-    matchDateTimeComponents: DateTimeComponents.time,
+    matchDateTimeComponents: DateTimeComponents.time, // <– ensures it repeats daily
     uiLocalNotificationDateInterpretation:
     UILocalNotificationDateInterpretation.absoluteTime,
   );

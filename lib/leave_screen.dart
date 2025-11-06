@@ -18,6 +18,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
 
   bool _showAll = false;
   int _selectedYear = DateTime.now().year;
+  final ScrollController _scrollController = ScrollController();
 
   final List<String> _leaveTypes = [
     "Casual Leave",
@@ -195,11 +196,11 @@ class _LeaveScreenState extends State<LeaveScreen> {
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
-            // 🔸 Filter Row
+            // 🔸 Top Controls
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                // Show All Toggle (always visible)
+                // Show All Toggle (Left)
                 Row(
                   children: [
                     Switch(
@@ -208,7 +209,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
                       onChanged: (val) {
                         setState(() {
                           _showAll = val;
-                          _selectedRange = null; // reset filters when toggling
+                          _selectedRange = null;
                         });
                       },
                     ),
@@ -216,7 +217,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
                   ],
                 ),
 
-                // Center - either Filter button or Year dropdown based on toggle
+                // Center Filter or Year Picker
                 if (!_showAll)
                   ElevatedButton.icon(
                     onPressed: () async {
@@ -226,8 +227,8 @@ class _LeaveScreenState extends State<LeaveScreen> {
                         lastDate: DateTime(DateTime.now().year + 1),
                         initialDateRange: _selectedRange ??
                             DateTimeRange(
-                              start: DateTime.now().subtract(const Duration(days: 7)),
-                              end: DateTime.now(),
+                              start: DateTime(DateTime.now().year, DateTime.now().month, 1),
+                              end: DateTime(DateTime.now().year, DateTime.now().month + 1, 0),
                             ),
                       );
                       if (picked != null) {
@@ -239,8 +240,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
                     icon: const Icon(Icons.filter_alt_outlined),
                     label: const Text("Filter"),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.orangeAccent,
-                    ),
+                        backgroundColor: Colors.orangeAccent),
                   )
                 else
                   DropdownButton<int>(
@@ -250,15 +250,28 @@ class _LeaveScreenState extends State<LeaveScreen> {
                       return DropdownMenuItem(value: year, child: Text("$year"));
                     }),
                     onChanged: (val) {
-                      setState(() {
-                        _selectedYear = val!;
-                      });
+                      setState(() => _selectedYear = val!);
                     },
                   ),
               ],
             ),
 
             const SizedBox(height: 8),
+
+            // 🔸 Dynamic Label
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                _showAll
+                    ? "Showing Year: $_selectedYear"
+                    : _selectedRange != null
+                    ? "Showing ${DateFormat('dd MMM').format(_selectedRange!.start)} - ${DateFormat('dd MMM yyyy').format(_selectedRange!.end)}"
+                    : "Showing ${DateFormat('dd MMM').format(DateTime(DateTime.now().year, DateTime.now().month, 1))} - ${DateFormat('dd MMM yyyy').format(DateTime(DateTime.now().year, DateTime.now().month + 1, 0))}",
+                style: const TextStyle(
+                    fontWeight: FontWeight.w600, color: Colors.black54),
+              ),
+            ),
+
             const Divider(),
 
             // 🔸 Leave List
@@ -279,27 +292,26 @@ class _LeaveScreenState extends State<LeaveScreen> {
                     return const Center(child: Text("No leave requests yet."));
                   }
 
-                  // Filter based on showAll or current month/year
                   final now = DateTime.now();
+
+                  // Apply filter logic
                   final filtered = docs.where((doc) {
                     final data = doc.data() as Map<String, dynamic>;
                     final start = (data["startDate"] as Timestamp).toDate();
 
-                    if (!_showAll && _selectedRange != null) {
-                      return start.isAfter(_selectedRange!.start.subtract(const Duration(days: 1))) &&
-                          start.isBefore(_selectedRange!.end.add(const Duration(days: 1)));
+                    if (_showAll) return start.year == _selectedYear;
+
+                    if (_selectedRange != null) {
+                      return start.isAfter(
+                          _selectedRange!.start.subtract(const Duration(days: 1))) &&
+                          start.isBefore(
+                              _selectedRange!.end.add(const Duration(days: 1)));
                     }
 
-                    if (_showAll) {
-                      return start.year == _selectedYear;
-                    }
-
-                    final now = DateTime.now();
                     return start.month == now.month && start.year == now.year;
                   }).toList();
 
-
-                  // Calculate total leave days
+                  // Count total leave days
                   int totalLeaves = 0;
                   for (var doc in filtered) {
                     final data = doc.data() as Map<String, dynamic>;
@@ -310,39 +322,49 @@ class _LeaveScreenState extends State<LeaveScreen> {
 
                   return Column(
                     children: [
-                      Text(
-                        "Showing ${_showAll ? "all requests for $_selectedYear" : "current month"} (${filtered.length} requests, $totalLeaves days)",
-                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Row(
+                          children: [
+                            const Icon(Icons.calendar_today, color: Colors.orange, size: 18),
+                            const SizedBox(width: 6),
+                            Text(
+                              "${filtered.length} Requests • $totalLeaves Day(s)",
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Colors.orange,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                       const SizedBox(height: 10),
                       Expanded(
+                  child: Scrollbar(
+                  controller: _scrollController,
+                  thumbVisibility: true, // 👈 Always show scrollbar
+                  radius: const Radius.circular(6),
+                  thickness: 6,
                         child: ListView.builder(
+                  controller: _scrollController,
                           itemCount: filtered.length,
                           itemBuilder: (context, index) {
-                            final data =
-                            filtered[index].data() as Map<String, dynamic>;
-                            final start =
-                            (data["startDate"] as Timestamp).toDate();
-                            final end =
-                            (data["endDate"] as Timestamp).toDate();
+                            final data = filtered[index].data() as Map<String, dynamic>;
+                            final start = (data["startDate"] as Timestamp).toDate();
+                            final end = (data["endDate"] as Timestamp).toDate();
                             final status = data["status"] ?? "Pending";
-                            final reason =
-                                data["reason"] ?? "No reason provided";
+                            final reason = data["reason"] ?? "No reason provided";
                             final type = data["type"] ?? "Leave";
 
                             Color statusColor = Colors.orange;
-                            if (status.toLowerCase() == "approved") {
-                              statusColor = Colors.green;
-                            } else if (status.toLowerCase() == "rejected") {
-                              statusColor = Colors.red;
-                            }
+                            if (status.toLowerCase() == "approved") statusColor = Colors.green;
+                            if (status.toLowerCase() == "rejected") statusColor = Colors.red;
 
                             return Card(
                               shape: RoundedRectangleBorder(
                                   borderRadius: BorderRadius.circular(10)),
                               elevation: 2,
-                              margin:
-                              const EdgeInsets.symmetric(vertical: 6),
+                              margin: const EdgeInsets.symmetric(vertical: 6),
                               child: Padding(
                                 padding: const EdgeInsets.all(12),
                                 child: Column(
@@ -354,8 +376,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
                                       children: [
                                         Text(
                                           start == end
-                                              ? DateFormat('dd MMM yyyy')
-                                              .format(start)
+                                              ? DateFormat('dd MMM yyyy').format(start)
                                               : "${DateFormat('dd MMM').format(start)} - ${DateFormat('dd MMM yyyy').format(end)}",
                                           style: const TextStyle(
                                               fontSize: 16,
@@ -384,6 +405,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
                           },
                         ),
                       ),
+                      ),
                     ],
                   );
                 },
@@ -394,4 +416,5 @@ class _LeaveScreenState extends State<LeaveScreen> {
       ),
     );
   }
+
 }
