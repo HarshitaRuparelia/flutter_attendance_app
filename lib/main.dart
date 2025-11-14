@@ -98,21 +98,84 @@ class MyApp extends StatelessWidget {
 }
 
 /// 🕙 Schedules a daily reminder notification at 10 AM
+/// 🕙 Schedules a daily 10 AM reminder notification with a dismiss action
 Future<void> scheduleDailyAttendanceReminder() async {
   tz.initializeTimeZones();
   tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
 
+  final uid = FirebaseAuth.instance.currentUser?.uid;
+  if (uid == null) return;
+
+  final firestore = FirebaseFirestore.instance;
+  final today = DateTime.now();
+  final todayStr =
+      "${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}";
+
+  // 🔹 1️⃣ Skip reminder on Sundays
+  if (today.weekday == DateTime.sunday) {
+    debugPrint("📆 Skipping reminder — Sunday.");
+    return;
+  }
+
+  // 🔹 2️⃣ Skip reminder on 2nd or 4th Saturday
+  if (today.weekday == DateTime.saturday) {
+    // Find which Saturday of the month it is
+    final firstDayOfMonth = DateTime(today.year, today.month, 1);
+    int saturdayCount = 0;
+    for (int i = 1; i <= today.day; i++) {
+      final d = DateTime(today.year, today.month, i);
+      if (d.weekday == DateTime.saturday) saturdayCount++;
+    }
+
+    if (saturdayCount == 2 || saturdayCount == 4) {
+      debugPrint("📆 Skipping reminder — ${saturdayCount}th Saturday.");
+      return;
+    }
+  }
+
+  // 🔹 3️⃣ Skip reminder if it's a holiday
+  final holidayDoc = await firestore.collection('holidays').doc(todayStr).get();
+  if (holidayDoc.exists) {
+    debugPrint("📆 Skipping reminder — Today ($todayStr) is a holiday.");
+    return;
+  }
+
+  // 🔹 4️⃣ Skip reminder if user is on approved leave
+  final leaveQuery = await firestore
+      .collection('leaves')
+      .where('userId', isEqualTo: uid)
+      .where('status', isEqualTo: 'Approved')
+      .get();
+
+  bool onLeaveToday = false;
+  for (var doc in leaveQuery.docs) {
+    final start = (doc['startDate'] as Timestamp).toDate();
+    final end = (doc['endDate'] as Timestamp).toDate();
+
+    if (today.isAfter(start.subtract(const Duration(days: 1))) &&
+        today.isBefore(end.add(const Duration(days: 1)))) {
+      onLeaveToday = true;
+      break;
+    }
+  }
+
+  if (onLeaveToday) {
+    debugPrint("📆 Skipping reminder — User is on approved leave today.");
+    return;
+  }
+
+  // 🔔 Initialize notifications
   const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
   const iosInit = DarwinInitializationSettings();
-  const initSettings = InitializationSettings(android: androidInit, iOS: iosInit);
+  const initSettings =
+  InitializationSettings(android: androidInit, iOS: iosInit);
+
   await flutterLocalNotificationsPlugin.initialize(
     initSettings,
-    onDidReceiveNotificationResponse: (NotificationResponse response) async {
+    onDidReceiveNotificationResponse:
+        (NotificationResponse response) async {
       if (response.actionId == 'DISMISS_ACTION') {
-        // User tapped "I'm Done"
-        debugPrint('✅ User dismissed the notification');
-
-        // Example: record this in Firestore or local DB
+        debugPrint('✅ User tapped "I’m Done" action');
         final uid = FirebaseAuth.instance.currentUser?.uid;
         if (uid != null) {
           await FirebaseFirestore.instance
@@ -120,9 +183,11 @@ Future<void> scheduleDailyAttendanceReminder() async {
               .doc(uid)
               .update({'lastNotificationDismissed': FieldValue.serverTimestamp()});
         }
+        await flutterLocalNotificationsPlugin.cancelAll();
       }
     },
   );
+
   final androidPlugin = flutterLocalNotificationsPlugin
       .resolvePlatformSpecificImplementation<
       AndroidFlutterLocalNotificationsPlugin>();
@@ -138,31 +203,29 @@ Future<void> scheduleDailyAttendanceReminder() async {
     enableVibration: true,
     actions: <AndroidNotificationAction>[
       AndroidNotificationAction(
-        'DISMISS_ACTION', // Unique action ID
-        'I’m Done ✅', // Button label
+        'DISMISS_ACTION',
+        'I’m Done ✅',
         showsUserInterface: true,
-        cancelNotification: true, // removes the notification when tapped
+        cancelNotification: true,
       ),
     ],
   );
   const details = NotificationDetails(android: androidDetails);
 
+  // ⏰ Schedule time
   final now = tz.TZDateTime.now(tz.local);
   var reminderTime = tz.TZDateTime(
     tz.local,
     now.year,
     now.month,
     now.day,
-    10,
-   // now.hour,
-   // now.minute + 1,
-    0
+    10, // 10 AM
+    0,
   );
   if (reminderTime.isBefore(now)) {
     reminderTime = reminderTime.add(const Duration(days: 1));
   }
-  //final nextReminder = reminderTime.isBefore(now) ? reminderTime.add(const Duration(days: 1)) : reminderTime;
-  //final nextReminder = now.add(const Duration(minutes: 3));
+
   await flutterLocalNotificationsPlugin.cancelAll();
 
   await flutterLocalNotificationsPlugin.zonedSchedule(
@@ -172,11 +235,15 @@ Future<void> scheduleDailyAttendanceReminder() async {
     reminderTime,
     details,
     androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
-    matchDateTimeComponents: DateTimeComponents.time, // <– ensures it repeats daily
+    matchDateTimeComponents: DateTimeComponents.time,
     uiLocalNotificationDateInterpretation:
     UILocalNotificationDateInterpretation.absoluteTime,
   );
+
+  debugPrint("🔔 Reminder scheduled for $reminderTime");
 }
+
+
 
 /// 🧾 Attendance screen wrapper
 class AttendanceApp extends StatelessWidget {

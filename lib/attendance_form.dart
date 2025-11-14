@@ -35,6 +35,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
   String _totalHours = "";
   bool _exemptionRequested = false;
   bool _noPunchInNeeded = false;
+  String? _message;
 
   // ---------------- Helper Methods ----------------
 
@@ -51,35 +52,48 @@ class _AttendanceFormState extends State<AttendanceForm> {
       return "User";
     }
   }
+
   Future<void> _checkNoPunchInDay() async {
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
 
+    String? reason;
+
     // 1️⃣ Sunday
     if (now.weekday == DateTime.sunday) {
-      setState(() => _noPunchInNeeded = true);
-      return;
+      reason = "No Punch-In needed today — It's Sunday (Weekly Holiday).";
     }
 
     // 2️⃣ 2nd or 4th Saturday
-    if (now.weekday == DateTime.saturday) {
-      // Find which Saturday it is (1-based)
-      final firstDayOfMonth = DateTime(now.year, now.month, 1);
+    else if (now.weekday == DateTime.saturday) {
       int saturdayCount = 0;
       for (int d = 1; d <= now.day; d++) {
         DateTime checkDay = DateTime(now.year, now.month, d);
-        if (checkDay.weekday == DateTime.saturday) {
-          saturdayCount++;
-        }
+        if (checkDay.weekday == DateTime.saturday) saturdayCount++;
       }
       if (saturdayCount == 2 || saturdayCount == 4) {
-        setState(() => _noPunchInNeeded = true);
-        return;
+        reason =
+        "No Punch-In needed today — It's ${saturdayCount == 2 ? "2nd" : "4th"} Saturday (Holiday).";
       }
     }
 
-    // 3️⃣ Leave applied for today
-    if (user != null) {
+    // 3️⃣ Admin-declared holidays (from Firestore)
+    if (reason == null) {
+      final holidaySnap = await FirebaseFirestore.instance
+          .collection("holidays")
+          .where("date", isGreaterThanOrEqualTo: Timestamp.fromDate(today))
+          .where("date", isLessThan: Timestamp.fromDate(today.add(const Duration(days: 1))))
+          .get();
+
+      if (holidaySnap.docs.isNotEmpty) {
+        final holidayData = holidaySnap.docs.first.data();
+        final holidayName = holidayData["name"] ?? "Holiday";
+        reason = "No Punch-In needed today — It's $holidayName.";
+      }
+    }
+
+    // 4️⃣ Leave applied for today
+    if (reason == null && user != null) {
       final leaveSnap = await FirebaseFirestore.instance
           .collection("leaves")
           .where("userId", isEqualTo: user!.uid)
@@ -88,9 +102,19 @@ class _AttendanceFormState extends State<AttendanceForm> {
           .get();
 
       if (leaveSnap.docs.isNotEmpty) {
-        setState(() => _noPunchInNeeded = true);
-        return;
+        final leaveData = leaveSnap.docs.first.data();
+        final leaveReason = leaveData["reason"] ?? "Leave";
+        reason =
+        "No Punch-In needed today — You are on leave (${leaveReason}).";
       }
+    }
+
+    // ✅ Final state update
+    if (reason != null) {
+      setState(() {
+        _noPunchInNeeded = true;
+        _message = reason;
+      });
     }
   }
 
@@ -364,10 +388,66 @@ class _AttendanceFormState extends State<AttendanceForm> {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
     }
   }
+  Future<void> _checkForAutoLogout() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final now = DateTime.now();
+    final yesterday = now.subtract(const Duration(days: 1));
+
+    // Find yesterday’s attendance record for this user
+    final query = await FirebaseFirestore.instance
+        .collection('attendance')
+        .where('userId', isEqualTo: user.uid)
+        .where('punchInDate', isGreaterThanOrEqualTo: DateTime(yesterday.year, yesterday.month, yesterday.day))
+        .where('punchInDate', isLessThan: DateTime(yesterday.year, yesterday.month, yesterday.day + 1))
+        .limit(1)
+        .get();
+
+    if (query.docs.isEmpty) return;
+
+    final doc = query.docs.first;
+    final data = doc.data();
+    final punchIn = (data['punchInTime'] as Timestamp?)?.toDate();
+    final punchOut = data['punchOutTime'];
+
+    // If no punch out found and it’s past midnight
+    if (punchIn != null && punchOut == null && now.hour >= 0) {
+      final autoPunchOut = DateTime(
+        punchIn.year,
+        punchIn.month,
+        punchIn.day,
+        19,
+        30,
+      );
+
+      final totalMinutes =
+      autoPunchOut.difference(punchIn).inMinutes.clamp(0, 24 * 60);
+      //final totalHours = (totalMinutes / 60).floor();
+
+      await doc.reference.update({
+        'punchOutTime': Timestamp.fromDate(autoPunchOut),
+        'punchOutSelfieUrl': 'auto_punchout',
+        'punchOutLatitude': 0.0,
+        'punchOutLongitude': 0.0,
+        'punchOutAddress': 'Auto punch-out by system',
+        'totalHours': totalMinutes,
+        'autoLogout': true,
+      });
+
+      if (mounted) {
+        setState(() {
+          _message = "⏰ Auto punch-out done for missing punch-in entry at 7:30 PM";
+        });
+      }
+    }
+  }
+
 
   @override
   void initState() {
     super.initState();
+    _checkForAutoLogout();
     _checkAttendance();
     _checkExemptionStatus();
     _checkNoPunchInDay();
@@ -398,10 +478,78 @@ class _AttendanceFormState extends State<AttendanceForm> {
                   decoration: const BoxDecoration(color: Colors.orangeAccent),
                   accountName: Text(snapshot.data ?? "User"),
                   accountEmail: Text(FirebaseAuth.instance.currentUser?.email ?? ""),
-                  currentAccountPicture: const CircleAvatar(
-                    backgroundColor: Colors.white,
-                    child: Icon(Icons.person, size: 40, color: Colors.orange),
+                  currentAccountPicture: CircleAvatar(
+                    //backgroundColor: Colors.red,
+                    child: Image.asset(
+                      'android/assets/images/Taxtech_Logo.png', // 👈 replace with your actual logo path
+                      height: 45,
+
+                    ),
+
                   ),
+                ),
+            /*DrawerHeader(
+            decoration: const BoxDecoration(
+            color: Colors.orange,
+            ),
+            margin: EdgeInsets.zero,
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  snapshot.data ?? "User",
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  FirebaseAuth.instance.currentUser?.email ?? "",
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 14,
+                  ),
+                ),
+              ],
+            ),
+          ),*/
+
+          /* UserAccountsDrawerHeader(
+                  margin: EdgeInsets.zero,
+                  decoration: const BoxDecoration(
+                    color: Colors.orange,
+                  ),
+                  accountName: Text(
+                    snapshot.data ?? "User",
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  accountEmail: Text(
+                    FirebaseAuth.instance.currentUser?.email ?? "",
+                    style: const TextStyle(fontSize: 14),
+                  ),
+                  // Removes extra space from avatar area
+                  currentAccountPicture: const SizedBox.shrink(),*/
+               //),
+                /*UserAccountsDrawerHeader(
+                  accountName: Text(snapshot.data ?? "User"),
+                  accountEmail: Text(FirebaseAuth.instance.currentUser?.email ?? ""),
+                  decoration: const BoxDecoration(color: Colors.orangeAccent),
+
+                ),*/
+                ListTile(
+                  leading: const Icon(Icons.history, color: Colors.orange),
+                  title: const Text("Attendance History"),
+                  onTap: () {
+                    Navigator.pop(context);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => const AttendanceHistoryScreen()),
+                    );
+                  },
                 ),
                 ListTile(
                   leading: const Icon(Icons.calendar_month, color: Colors.orange),
@@ -414,17 +562,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
                     );
                   },
                 ),
-                ListTile(
-                  leading: const Icon(Icons.history, color: Colors.orange),
-                  title: const Text("Attendance History"),
-                  onTap: () {
-                    Navigator.pop(context);
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (_) => const AttendanceHistoryScreen()),
-                    );
-                  },
-                ),
+
                 const Divider(),
                 ListTile(
                   leading: const Icon(Icons.logout, color: Colors.red),
@@ -439,22 +577,51 @@ class _AttendanceFormState extends State<AttendanceForm> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                if (_message != null)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    child: Card(
+                      color: Colors.orange[50],
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      elevation: 2,
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.access_time, color: Colors.orange),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                _message!,
+                                style: const TextStyle(
+                                  fontSize: 14,
+                                  color: Colors.orange,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+
                 if (_noPunchInNeeded)
                     Card(
                       color: Colors.orange[100],
                       shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(10)),
                       margin: const EdgeInsets.only(bottom: 16),
-                      child: const Padding(
-                        padding: EdgeInsets.all(16),
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
                         child: Row(
                           children: [
-                            Icon(Icons.info_outline, color: Colors.orange),
-                            SizedBox(width: 10),
+                            const Icon(Icons.info_outline, color: Colors.orange),
+                            const SizedBox(width: 10),
                             Expanded(
                               child: Text(
-                                "No Punch-In needed today",
-                                style: TextStyle(
+                                _message ?? "No Punch-In needed today.",
+                                style: const TextStyle(
                                   color: Colors.orange,
                                   fontWeight: FontWeight.w600,
                                   fontSize: 16,
