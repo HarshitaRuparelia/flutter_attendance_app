@@ -15,6 +15,57 @@ import 'package:timezone/timezone.dart' as tz;
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
 FlutterLocalNotificationsPlugin();
 
+Future<void> initNotifications() async {
+  print("initNotifications");
+  const android = AndroidInitializationSettings('@mipmap/ic_launcher');
+
+  const initSettings = InitializationSettings(
+    android: android,
+  );
+
+  await flutterLocalNotificationsPlugin.initialize(
+    initSettings,
+    onDidReceiveNotificationResponse: onNotificationResponse,
+  );
+}
+
+Future<void> onNotificationResponse(NotificationResponse response) async {
+  print("onNotificationResponse");
+  final uid = FirebaseAuth.instance.currentUser?.uid;
+  if (uid == null) return;
+
+  final userDoc =
+  FirebaseFirestore.instance.collection('users').doc(uid);
+
+  final now = DateTime.now();
+  print("🔔 NotificationResponse received:");
+  print("  type=${response.notificationResponseType}");
+  print("  actionId=${response.actionId}");
+
+  // User tapped the notification body
+  if (response.notificationResponseType ==
+      NotificationResponseType.selectedNotification) {
+    print("User tapped the notification body");
+    await userDoc.update({
+      "lastNotificationAction": now,
+      "lastAction": "notification_clicked",
+    });
+    return;
+  }
+
+  // User tapped the "I'm Done" button
+  if (response.actionId == "DISMISS_ACTION") {
+    print("User tapped the Im Done button");
+    await userDoc.update({
+      "lastNotificationAction": now,
+      "lastAction": "pressed_done_button",
+    });
+    return;
+  }
+}
+
+
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -22,25 +73,14 @@ void main() async {
     options: DefaultFirebaseOptions.currentPlatform,
   );
 
-  // 🔒 App Check — Web version MUST use ReCaptcha
- /* if (kIsWeb) {
-    *//*await FirebaseAppCheck.instance.activate(
-      webRecaptchaSiteKey: '6LejXRAsAAAAAJIIIt1wUlH-vpsK7lCRBWh7eZ_y',
-    );*//*
-   *//* await FirebaseAppCheck.instance.activate(
-      webProvider: ReCaptchaV3Provider('6LejXRAsAAAAAJIIIt1wUlH-vpsK7lCRBWh7eZ_y'),
-    );*//*
-  } else {
-    await FirebaseAppCheck.instance.activate();
-  }*/
-
   // 🟠 Initialize notifications ONLY on mobile
   if (!kIsWeb) {
-    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    initNotifications();
+   /* const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
     const iosInit = DarwinInitializationSettings();
     const settings = InitializationSettings(android: androidInit, iOS: iosInit);
     await flutterLocalNotificationsPlugin.initialize(settings,
-        onDidReceiveNotificationResponse: (resp) {});
+        onDidReceiveNotificationResponse: onNotificationResponse);*/
   }
 
   runApp(const MyApp());
@@ -107,10 +147,7 @@ class MyApp extends StatelessWidget {
 
 /// 🕙 DAILY REMINDER — Mobile Only
 Future<void> scheduleDailyAttendanceReminder() async {
-  if (kIsWeb) {
-    print("⛔ Skipping reminders on Web");
-    return;
-  }
+  if (kIsWeb) return;
 
   tz.initializeTimeZones();
   tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
@@ -139,8 +176,7 @@ Future<void> scheduleDailyAttendanceReminder() async {
   }
 
   // 3️⃣ Holiday check
-  final holidayDoc =
-  await firestore.collection('holidays').doc(dateStr).get();
+  final holidayDoc = await firestore.collection('holidays').doc(dateStr).get();
   if (holidayDoc.exists) return;
 
   // 4️⃣ Leave check
@@ -154,13 +190,12 @@ Future<void> scheduleDailyAttendanceReminder() async {
     final start = (l['startDate'] as Timestamp).toDate();
     final end = (l['endDate'] as Timestamp).toDate();
 
-    if (today.isAfter(start.subtract(const Duration(days: 1))) &&
-        today.isBefore(end.add(const Duration(days: 1)))) {
+    if (!today.isBefore(start) && !today.isAfter(end)) {
       return;
     }
   }
 
-  // 🔔 Android notification details
+  // Notification config
   const androidDetails = AndroidNotificationDetails(
     'attendance_reminder_channel',
     'Attendance Reminder',
@@ -179,17 +214,17 @@ Future<void> scheduleDailyAttendanceReminder() async {
   const details = NotificationDetails(android: androidDetails);
 
   final now = tz.TZDateTime.now(tz.local);
-  var scheduleTime =
-  tz.TZDateTime(tz.local, now.year, now.month, now.day, 10);
-
+  var scheduleTime = tz.TZDateTime(tz.local, now.year, now.month, now.day, 10);
+  // for testing
+ // var scheduleTime = now.add(const Duration(minutes: 1));
+  // If it's already past 10 AM: remind next day
   if (scheduleTime.isBefore(now)) {
     scheduleTime = scheduleTime.add(const Duration(days: 1));
   }
 
-  await flutterLocalNotificationsPlugin.cancelAll();
-
+  // ❗ DO NOT cancel all notifications → allows tomorrow's reminder
   await flutterLocalNotificationsPlugin.zonedSchedule(
-    0,
+    101, // use a consistent ID
     'Attendance Reminder',
     'Please mark your attendance 📸',
     scheduleTime,
@@ -197,8 +232,10 @@ Future<void> scheduleDailyAttendanceReminder() async {
     uiLocalNotificationDateInterpretation:
     UILocalNotificationDateInterpretation.absoluteTime,
     androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+    matchDateTimeComponents: DateTimeComponents.time, // 🔥 repeats daily
   );
 }
+
 
 class AttendanceApp extends StatelessWidget {
   const AttendanceApp({super.key});

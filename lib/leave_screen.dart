@@ -37,14 +37,13 @@ class _LeaveScreenState extends State<LeaveScreen> {
     );
 
     if (picked != null) {
-      setState(() {
-        _selectedRange = picked;
-      });
+      setState(() => _selectedRange = picked);
     }
   }
 
   Future<void> _applyLeave() async {
     final userId = FirebaseAuth.instance.currentUser?.uid;
+
     if (_selectedRange == null ||
         _leaveType == null ||
         _reasonController.text.trim().isEmpty) {
@@ -58,25 +57,21 @@ class _LeaveScreenState extends State<LeaveScreen> {
 
     final leaveRef = FirebaseFirestore.instance.collection("leaves");
 
-    // Check for overlapping leave
+    // ✔ Optimized overlap query
     final overlap = await leaveRef
         .where("userId", isEqualTo: userId)
+        .where("endDate", isGreaterThanOrEqualTo: _selectedRange!.start)
+        .where("startDate", isLessThanOrEqualTo: _selectedRange!.end)
         .get();
 
-    for (var doc in overlap.docs) {
-      final data = doc.data();
-      final existingStart = (data["startDate"] as Timestamp).toDate();
-      final existingEnd = (data["endDate"] as Timestamp).toDate();
-
-      if (_selectedRange!.start.isBefore(existingEnd.add(const Duration(days: 1))) &&
-          _selectedRange!.end.isAfter(existingStart.subtract(const Duration(days: 1)))) {
-        setState(() => _loading = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text("Leave already applied for selected dates.")),
-        );
-        return;
-      }
+    if (overlap.docs.isNotEmpty) {
+      setState(() => _loading = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Leave already applied for selected dates."),
+        ),
+      );
+      return;
     }
 
     await leaveRef.add({
@@ -92,6 +87,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
     setState(() => _loading = false);
 
     Navigator.pop(context);
+
     _reasonController.clear();
     _selectedRange = null;
     _leaveType = null;
@@ -124,7 +120,8 @@ class _LeaveScreenState extends State<LeaveScreen> {
                           : "${DateFormat('dd MMM').format(_selectedRange!.start)} - ${DateFormat('dd MMM yyyy').format(_selectedRange!.end)}",
                     ),
                     style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.orangeAccent),
+                      backgroundColor: Colors.orangeAccent,
+                    ),
                   ),
                   const SizedBox(height: 10),
                   DropdownButtonFormField<String>(
@@ -137,7 +134,8 @@ class _LeaveScreenState extends State<LeaveScreen> {
                         .map((type) =>
                         DropdownMenuItem(value: type, child: Text(type)))
                         .toList(),
-                    onChanged: (val) => setDialogState(() => _leaveType = val),
+                    onChanged: (val) =>
+                        setDialogState(() => _leaveType = val),
                   ),
                   const SizedBox(height: 10),
                   TextField(
@@ -159,7 +157,8 @@ class _LeaveScreenState extends State<LeaveScreen> {
               ElevatedButton(
                 onPressed: _loading ? null : _applyLeave,
                 style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.orangeAccent),
+                  backgroundColor: Colors.orangeAccent,
+                ),
                 child: _loading
                     ? const SizedBox(
                   height: 20,
@@ -196,69 +195,65 @@ class _LeaveScreenState extends State<LeaveScreen> {
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
-            // 🔸 Top Controls
+            // Top Controls -----------------------------------------------------
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                // Show All Toggle (Left)
                 Row(
                   children: [
                     Switch(
                       value: _showAll,
                       activeColor: Colors.orangeAccent,
-                      onChanged: (val) {
-                        setState(() {
-                          _showAll = val;
-                          _selectedRange = null;
-                        });
-                      },
+                      onChanged: (val) =>
+                          setState(() => _showAll = val),
                     ),
                     const Text("Show All"),
                   ],
                 ),
 
-                // Center Filter or Year Picker
-                if (!_showAll)
-                  ElevatedButton.icon(
-                    onPressed: () async {
-                      final picked = await showDateRangePicker(
-                        context: context,
-                        firstDate: DateTime(DateTime.now().year - 1),
-                        lastDate: DateTime(DateTime.now().year + 1),
-                        initialDateRange: _selectedRange ??
-                            DateTimeRange(
-                              start: DateTime(DateTime.now().year, DateTime.now().month, 1),
-                              end: DateTime(DateTime.now().year, DateTime.now().month + 1, 0),
-                            ),
-                      );
-                      if (picked != null) {
-                        setState(() {
-                          _selectedRange = picked;
-                        });
-                      }
-                    },
-                    icon: const Icon(Icons.filter_alt_outlined),
-                    label: const Text("Filter"),
-                    style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.orangeAccent),
-                  )
-                else
-                  DropdownButton<int>(
-                    value: _selectedYear,
-                    items: List.generate(5, (i) {
-                      int year = DateTime.now().year - i;
-                      return DropdownMenuItem(value: year, child: Text("$year"));
-                    }),
-                    onChanged: (val) {
-                      setState(() => _selectedYear = val!);
-                    },
+                (!_showAll)
+                    ? ElevatedButton.icon(
+                  onPressed: () async {
+                    final picked = await showDateRangePicker(
+                      context: context,
+                      firstDate: DateTime(DateTime.now().year - 1),
+                      lastDate: DateTime(DateTime.now().year + 1),
+                      initialDateRange: _selectedRange ??
+                          DateTimeRange(
+                            start: DateTime(DateTime.now().year,
+                                DateTime.now().month, 1),
+                            end: DateTime(DateTime.now().year,
+                                DateTime.now().month + 1, 0),
+                          ),
+                    );
+                    if (picked != null) {
+                      setState(() => _selectedRange = picked);
+                    }
+                  },
+                  icon: const Icon(Icons.filter_alt_outlined),
+                  label: const Text("Filter"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.orangeAccent,
                   ),
+                )
+                    : DropdownButton<int>(
+                  value: _selectedYear,
+                  items: List.generate(
+                    5,
+                        (i) => DropdownMenuItem(
+                      value: DateTime.now().year - i,
+                      child: Text("${DateTime.now().year - i}"),
+                    ),
+                  ),
+                  onChanged: (val) =>
+                      setState(() => _selectedYear = val!),
+                ),
               ],
             ),
 
             const SizedBox(height: 8),
 
-            // 🔸 Dynamic Label
+            // Range Label -----------------------------------------------------
             Align(
               alignment: Alignment.centerLeft,
               child: Text(
@@ -268,13 +263,15 @@ class _LeaveScreenState extends State<LeaveScreen> {
                     ? "Showing ${DateFormat('dd MMM').format(_selectedRange!.start)} - ${DateFormat('dd MMM yyyy').format(_selectedRange!.end)}"
                     : "Showing ${DateFormat('dd MMM').format(DateTime(DateTime.now().year, DateTime.now().month, 1))} - ${DateFormat('dd MMM yyyy').format(DateTime(DateTime.now().year, DateTime.now().month + 1, 0))}",
                 style: const TextStyle(
-                    fontWeight: FontWeight.w600, color: Colors.black54),
+                  fontWeight: FontWeight.w600,
+                  color: Colors.black54,
+                ),
               ),
             ),
 
             const Divider(),
 
-            // 🔸 Leave List
+            // Leave List ------------------------------------------------------
             Expanded(
               child: StreamBuilder<QuerySnapshot>(
                 stream: FirebaseFirestore.instance
@@ -294,117 +291,151 @@ class _LeaveScreenState extends State<LeaveScreen> {
 
                   final now = DateTime.now();
 
-                  // Apply filter logic
+                  // Apply filter
                   final filtered = docs.where((doc) {
                     final data = doc.data() as Map<String, dynamic>;
                     final start = (data["startDate"] as Timestamp).toDate();
+                    final end = (data["endDate"] as Timestamp).toDate();
 
-                    if (_showAll) return start.year == _selectedYear;
-
-                    if (_selectedRange != null) {
-                      return start.isAfter(
-                          _selectedRange!.start.subtract(const Duration(days: 1))) &&
-                          start.isBefore(
-                              _selectedRange!.end.add(const Duration(days: 1)));
+                    if (_showAll) {
+                      return start.year == _selectedYear || end.year == _selectedYear;
                     }
 
-                    return start.month == now.month && start.year == now.year;
+                    if (_selectedRange != null) {
+                      final filterStart = _selectedRange!.start;
+                      final filterEnd = _selectedRange!.end;
+
+                      // ✅ Overlap logic
+                      return start.isBefore(filterEnd.add(const Duration(days: 1))) &&
+                          end.isAfter(filterStart.subtract(const Duration(days: 1)));
+                    }
+
+                    // Default → current month (still using overlap logic)
+                    final monthStart = DateTime(now.year, now.month, 1);
+                    final monthEnd = DateTime(now.year, now.month + 1, 0);
+
+                    return start.isBefore(monthEnd.add(const Duration(days: 1))) &&
+                        end.isAfter(monthStart.subtract(const Duration(days: 1)));
                   }).toList();
 
-                  // Count total leave days
-                  int totalLeaves = 0;
-                  for (var doc in filtered) {
-                    final data = doc.data() as Map<String, dynamic>;
-                    final start = (data["startDate"] as Timestamp).toDate();
-                    final end = (data["endDate"] as Timestamp).toDate();
-                    totalLeaves += end.difference(start).inDays + 1;
-                  }
+
+                  // Count leave days
+                  final totalLeaves = filtered.fold<int>(
+                    0,
+                        (prev, doc) {
+                      final data = doc.data() as Map<String, dynamic>;
+                      final start =
+                      (data["startDate"] as Timestamp).toDate();
+                      final end =
+                      (data["endDate"] as Timestamp).toDate();
+                      return prev + end.difference(start).inDays + 1;
+                    },
+                  );
 
                   return Column(
                     children: [
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: Row(
-                          children: [
-                            const Icon(Icons.calendar_today, color: Colors.orange, size: 18),
-                            const SizedBox(width: 6),
-                            Text(
-                              "${filtered.length} Requests • $totalLeaves Day(s)",
-                              style: const TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: Colors.orange,
-                              ),
+                      Row(
+                        children: [
+                          const Icon(Icons.calendar_today,
+                              color: Colors.orange, size: 18),
+                          const SizedBox(width: 6),
+                          Text(
+                            "${filtered.length} Requests • $totalLeaves Day(s)",
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.orange,
                             ),
-                          ],
-                        ),
+                          ),
+                        ],
                       ),
                       const SizedBox(height: 10),
+
                       Expanded(
-                  child: Scrollbar(
-                  controller: _scrollController,
-                  thumbVisibility: true, // 👈 Always show scrollbar
-                  radius: const Radius.circular(6),
-                  thickness: 6,
-                        child: ListView.builder(
-                  controller: _scrollController,
-                          itemCount: filtered.length,
-                          itemBuilder: (context, index) {
-                            final data = filtered[index].data() as Map<String, dynamic>;
-                            final start = (data["startDate"] as Timestamp).toDate();
-                            final end = (data["endDate"] as Timestamp).toDate();
-                            final status = data["status"] ?? "Pending";
-                            final reason = data["reason"] ?? "No reason provided";
-                            final type = data["type"] ?? "Leave";
+                        child: Scrollbar(
+                          controller: _scrollController,
+                          thumbVisibility: true,
+                          radius: const Radius.circular(6),
+                          thickness: 6,
+                          child: ListView.builder(
+                            controller: _scrollController,
+                            itemCount: filtered.length,
+                            itemBuilder: (context, index) {
+                              final data = filtered[index].data()
+                              as Map<String, dynamic>;
+                              final start = (data["startDate"] as Timestamp)
+                                  .toDate();
+                              final end = (data["endDate"] as Timestamp).toDate();
+                              final status = data["status"] ?? "Pending";
+                              final reason =
+                                  data["reason"] ?? "No reason provided";
+                              final type = data["type"] ?? "Leave";
 
-                            Color statusColor = Colors.orange;
-                            if (status.toLowerCase() == "approved") statusColor = Colors.green;
-                            if (status.toLowerCase() == "rejected") statusColor = Colors.red;
+                              Color color = Colors.orange;
+                              switch (status.toLowerCase()) {
+                                case "approved":
+                                  color = Colors.green;
+                                  break;
+                                case "rejected":
+                                  color = Colors.red;
+                                  break;
+                              }
 
-                            return Card(
-                              shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(10)),
-                              elevation: 2,
-                              margin: const EdgeInsets.symmetric(vertical: 6),
-                              child: Padding(
-                                padding: const EdgeInsets.all(12),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Row(
-                                      mainAxisAlignment:
-                                      MainAxisAlignment.spaceBetween,
-                                      children: [
-                                        Text(
-                                          start == end
-                                              ? DateFormat('dd MMM yyyy').format(start)
-                                              : "${DateFormat('dd MMM').format(start)} - ${DateFormat('dd MMM yyyy').format(end)}",
-                                          style: const TextStyle(
-                                              fontSize: 16,
-                                              fontWeight: FontWeight.bold),
-                                        ),
-                                        Chip(
-                                          label: Text(status,
-                                              style: const TextStyle(
-                                                  color: Colors.white)),
-                                          backgroundColor: statusColor,
-                                        ),
-                                      ],
-                                    ),
-                                    const SizedBox(height: 6),
-                                    Text("Type: $type",
-                                        style: const TextStyle(
-                                            fontWeight: FontWeight.w500)),
-                                    const SizedBox(height: 4),
-                                    Text("Reason: $reason",
-                                        style: const TextStyle(
-                                            color: Colors.black87)),
-                                  ],
+                              return Card(
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
                                 ),
-                              ),
-                            );
-                          },
+                                elevation: 2,
+                                margin:
+                                const EdgeInsets.symmetric(vertical: 6),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(12),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                    CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        mainAxisAlignment:
+                                        MainAxisAlignment.spaceBetween,
+                                        children: [
+                                          Text(
+                                            start == end
+                                                ? DateFormat('dd MMM yyyy')
+                                                .format(start)
+                                                : "${DateFormat('dd MMM').format(start)} - ${DateFormat('dd MMM yyyy').format(end)}",
+                                            style: const TextStyle(
+                                              fontSize: 16,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                          Chip(
+                                            label: Text(
+                                              status,
+                                              style: const TextStyle(
+                                                  color: Colors.white),
+                                            ),
+                                            backgroundColor: color,
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        "Type: $type",
+                                        style: const TextStyle(
+                                            fontWeight: FontWeight.w500),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        "Reason: $reason",
+                                        style: const TextStyle(
+                                            color: Colors.black87),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
                         ),
-                      ),
                       ),
                     ],
                   );
@@ -416,5 +447,4 @@ class _LeaveScreenState extends State<LeaveScreen> {
       ),
     );
   }
-
 }
