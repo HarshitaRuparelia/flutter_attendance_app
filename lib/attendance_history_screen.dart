@@ -25,17 +25,35 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
     _horizontalController.dispose();
     super.dispose();
   }
+  @override
+  void initState() {
+    super.initState();
+    // Default to today
+    final today = DateTime.now();
+    _startDate = DateTime(today.year, today.month, today.day);
+    _endDate = DateTime(today.year, today.month, today.day);
+
+    // Fetch today's attendance immediately
+    _fetchAttendanceData();
+  }
 
   // Pick date range
   Future<void> _pickDateRange() async {
     final now = DateTime.now();
+
+    // Use previously selected range, else default to today
+    final initialRange = (_startDate != null && _endDate != null)
+        ? DateTimeRange(start: _startDate!, end: _endDate!)
+        : DateTimeRange(
+      start: DateTime(now.year, now.month, now.day),
+      end: DateTime(now.year, now.month, now.day),
+    );
+
     final picked = await showDateRangePicker(
       context: context,
       firstDate: DateTime(now.year - 1),
       lastDate: now,
-      initialDateRange: _startDate != null && _endDate != null
-          ? DateTimeRange(start: _startDate!, end: _endDate!)
-          : null,
+      initialDateRange: initialRange,
     );
 
     if (picked != null) {
@@ -46,6 +64,7 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
       _fetchAttendanceData();
     }
   }
+
 
   // Fetch attendance from Firestore
   Future<void> _fetchAttendanceData() async {
@@ -163,22 +182,51 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
       context: context,
       builder: (_) => Dialog(
         child: InteractiveViewer(
-          child: Image.network(url, fit: BoxFit.contain),
+          child: Image.network(
+            url,
+            fit: BoxFit.contain,
+            loadingBuilder: (context, child, loadingProgress) {
+              if (loadingProgress == null) return child;
+              return SizedBox(
+                height: 200,
+                child: const Center(
+                  child: CircularProgressIndicator(),
+                ),
+              );
+            },
+            errorBuilder: (context, error, stackTrace) {
+              return SizedBox(
+                height: 200,
+                child: const Center(
+                  child: Icon(
+                    Icons.image_not_supported,
+                    size: 50,
+                    //color: Colors.grey,
+                  ),
+                ),
+              );
+            },
+          ),
         ),
       ),
     );
   }
 
+
   // Convert minutes to “X hr Y min” format
   String _formatTotalHours(dynamic totalMinutes) {
     if (totalMinutes == null) return "-";
-    final int mins = totalMinutes is int
-        ? totalMinutes
-        : int.tryParse(totalMinutes.toString()) ?? 0;
+
+    final double mins = totalMinutes is int
+        ? totalMinutes.toDouble()
+        : double.tryParse(totalMinutes.toString()) ?? 0.0;
+
     final int hrs = mins ~/ 60;
-    final int remMins = mins % 60;
+    final int remMins = (mins % 60).round(); // ceil rounds up
+
     return "$hrs h ${remMins.toString().padLeft(2, '0')} m";
   }
+
 
   @override
   Widget build(BuildContext context) {
@@ -200,9 +248,11 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
                     onPressed: _pickDateRange,
                     icon: const Icon(Icons.date_range),
                     label: Text(
-                      _startDate == null
+                      _startDate == null || _endDate == null
                           ? "Select Date Range"
-                          : "${DateFormat('dd MMM yyyy').format(_startDate!)} - ${DateFormat('dd MMM yyyy').format(_endDate!)}",
+                          : (_startDate!.isAtSameMomentAs(_endDate!)
+                          ? DateFormat('dd MMM yyyy').format(_startDate!)
+                          : "${DateFormat('dd MMM yyyy').format(_startDate!)} - ${DateFormat('dd MMM yyyy').format(_endDate!)}"),
                     ),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.orangeAccent,
@@ -420,28 +470,30 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
                                       ],
                                     );
                                   } else {
-                                    final punchIn =
-                                        (data['punchInTime'] as Timestamp?)
-                                            ?.toDate();
-                                    final punchOut =
-                                        (data['punchOutTime'] as Timestamp?)
-                                            ?.toDate();
+                                    final punchIn = (data['punchInTime'] as Timestamp?)?.toDate();
+                                    final punchOut = (data['punchOutTime'] as Timestamp?)?.toDate();
                                     final isLate = data['isLate'] == true;
-                                    final exempt =
-                                        data['exemptionRequested'] == true
-                                        ? 'Requested'
-                                        : '—';
-                                    final totalMins =
-                                        ((data['totalHours'] ?? 0) as num)
-                                            .toInt();
-                                    final totalHoursStr = _formatTotalHours(
-                                      totalMins,
-                                    );
+                                    final exemptionStatus = data['exemptionStatus'] ;
                                     final punchInUrl = data['punchInSelfieUrl'];
-                                    final punchOutUrl =
-                                        data['punchOutSelfieUrl'];
-                                    final isHalfDay =
-                                        totalMins < 540; // 9 hours * 60 minutes
+                                    final punchOutUrl = data['punchOutSelfieUrl'];
+
+                                    // 👉 CORRECT: Use "-" when no punch out
+                                    String totalHoursStr;
+                                    bool isHalfDay = false;
+
+                                    if (punchOut == null) {
+                                      totalHoursStr = "-"; // user has not punched out
+                                    } else {
+                                      int mins = 0;
+
+                                      if (data['totalHours'] != null) {
+                                        mins = (data['totalHours'] as num).toInt();
+                                      }
+
+                                      totalHoursStr = _formatTotalHours(mins);
+                                      isHalfDay = mins < 540; // 9 hours
+                                    }
+
 
                                     return DataRow(
                                       color: MaterialStateProperty.all(
@@ -469,6 +521,7 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
                                               color: isLate
                                                   ? Colors.red
                                                   : Colors.black,
+                                              fontWeight: isLate ? FontWeight.bold : FontWeight.normal,
                                             ),
                                           ),
                                         ),
@@ -483,70 +536,141 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
                                         ),
 
                                         // ✅ Total Hours Column with Half-Day logic
-                                        DataCell(
-                                          isHalfDay
-                                              ? Row(
-                                                  children: [
-                                                    const Icon(
-                                                      Icons.access_time_filled,
-                                                      color: Colors.red,
-                                                      size: 18,
-                                                    ),
-                                                    const SizedBox(width: 4),
-                                                    Text(
-                                                      "$totalHoursStr (Half Day)",
-                                                      style: const TextStyle(
-                                                        color: Colors.red,
-                                                        fontWeight:
-                                                            FontWeight.bold,
-                                                      ),
-                                                    ),
-                                                  ],
-                                                )
-                                              : Text(totalHoursStr),
-                                        ),
+                                  DataCell(
+                                  isHalfDay
+                                  ? (exemptionStatus == "approved"
+                                  // ⭐ Approved → Green + no half-day label + verified icon
+                                  ? Row(
+                                  children: [
+                                  const Icon(
+                                  Icons.verified_user,
+                                  color: Colors.green,
+                                  size: 18,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                  totalHoursStr,
+                                  style: const TextStyle(
+                                  color: Colors.green,
+                                  fontWeight: FontWeight.bold,
+                                  ),
+                                  ),
+                                  ],
+                                  )
 
-                                        DataCell(
-                                          Text(
-                                            exempt,
-                                            style: TextStyle(
-                                              color: exempt == 'Requested'
-                                                  ? Colors.orange
-                                                  : Colors.grey,
-                                            ),
+                                  // ❌ Not approved → Red + Half Day label + red clock icon
+                                      : Row(
+                                  children: [
+                                  const Icon(
+                                  Icons.access_time_filled,
+                                  color: Colors.red,
+                                  size: 18,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                  "$totalHoursStr (Half Day)",
+                                  style: const TextStyle(
+                                  color: Colors.red,
+                                  fontWeight: FontWeight.bold,
+                                  ),
+                                  ),
+                                  ],
+                                  ))
+
+                                  // Normal day → no icon, black text
+                                      : Text(
+                                  totalHoursStr,
+                                  style: const TextStyle(
+                                  color: Colors.black,
+                                  fontWeight: FontWeight.bold,
+                                  ),
+                                  ),
+                                  ),
+
+
+                                  DataCell(
+                                          Builder(
+                                            builder: (_) {
+                                              String text = "Seek Exemption";
+                                              Color color = Colors.orange;
+
+                                             // final punchOutTime = data["punchOutTime"];
+                                              final exemptionStatus = data["exemptionStatus"];
+
+                                              // ➤ User has not punched out
+                                              if (punchOut == null) {
+                                                text = "Not punched out yet";
+                                                color = Colors.black;
+                                              }
+                                              // ➤ Exemption Requested
+                                              else if (exemptionStatus == "requested") {
+                                                text = "Exemption Requested";
+                                                color = Colors.grey;
+                                              }
+                                              // ➤ Exemption Approved
+                                              else if (exemptionStatus == "approved") {
+                                                text = "Exempted ✅";
+                                                color = Colors.grey;
+                                              }
+
+                                              return Text(
+                                                text,
+                                                style: TextStyle(
+                                                  color: color,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              );
+                                            },
                                           ),
                                         ),
+
                                         const DataCell(Text('—')),
                                         DataCell(
                                           punchInUrl != null
-                                              ? GestureDetector(
-                                                  onTap: () => _showFullImage(
-                                                    punchInUrl,
-                                                  ),
-                                                  child: Image.network(
-                                                    punchInUrl,
-                                                    height: 40,
-                                                    width: 40,
-                                                    fit: BoxFit.cover,
-                                                  ),
-                                                )
+                                              ? InkWell(
+                                            onTap: () => _showFullImage(punchInUrl),
+                                            child: Container(
+                                              height: 40,
+                                              width: 40,
+                                              decoration: BoxDecoration(
+                                                border: Border.all(color: Colors.grey.shade300),
+                                              ),
+                                              child: Image.network(
+                                                punchInUrl,
+                                                fit: BoxFit.cover,
+                                                errorBuilder: (context, error, stackTrace) => const Icon(
+                                                  Icons.image_not_supported,
+                                                  size: 40,
+                                                ),
+                                              ),
+                                            ),
+                                          )
                                               : const Text('-'),
                                         ),
+
                                         DataCell(
                                           punchOutUrl != null
-                                              ? GestureDetector(
-                                                  onTap: () => _showFullImage(
-                                                    punchOutUrl,
-                                                  ),
-                                                  child: Image.network(
-                                                    punchOutUrl,
-                                                    height: 40,
-                                                    width: 40,
-                                                    fit: BoxFit.cover,
-                                                  ),
-                                                )
+                                              ? InkWell(
+                                            onTap: () => _showFullImage(punchOutUrl),
+                                            child: Container(
+                                              height: 40,
+                                              width: 40,
+                                              decoration: BoxDecoration(
+                                                border: Border.all(color: Colors.grey.shade300),
+                                              ),
+                                              child: Image.network(
+                                                punchOutUrl,
+                                                fit: BoxFit.cover,
+                                                errorBuilder: (context, error, stackTrace) => const Icon(
+                                                  Icons.image_not_supported,
+                                                  size: 40,
+                                                ),
+                                              ),
+                                            ),
+                                          )
                                               : const Text('-'),
                                         ),
+
                                       ],
                                     );
                                   }

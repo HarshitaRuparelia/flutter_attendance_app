@@ -6,11 +6,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
-
+import 'package:flutter/foundation.dart';
 import 'attendance_history_screen.dart';
 import 'leave_screen.dart';
+import 'dart:io' show File;
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'camera_screen_wrapper.dart';
 
 class AttendanceForm extends StatefulWidget {
   const AttendanceForm({super.key});
@@ -36,6 +39,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
   bool _exemptionRequested = false;
   bool _noPunchInNeeded = false;
   String? _message;
+  Uint8List? _punchInImageBytes;
+  Uint8List? _punchOutImageBytes;
+  bool _isPreviewLoading = false;
 
   // ---------------- Helper Methods ----------------
 
@@ -118,57 +124,134 @@ class _AttendanceFormState extends State<AttendanceForm> {
     }
   }
 
-
   Future<void> _captureSelfie({required bool isPunchOut}) async {
-    final picker = ImagePicker();
-    final picked = await picker.pickImage(source: ImageSource.camera);
-    if (picked != null) {
-      File imageFile = File(picked.path);
-      await _getLocation();
+    print("_captureSelfie new");
+
+    final capturedBytes = await Navigator.push(
+      context,
+      MaterialPageRoute(
+          builder: (_) => CameraScreenWrapper()),
+    );
+    print("_captureSelfie result = $capturedBytes");
+
+    if (capturedBytes == null) return;
+    await _getLocation();
+
+    Uint8List bytes;
+    File? file;
+
+    if (capturedBytes is File) {
+      file = capturedBytes;
+      bytes = await capturedBytes.readAsBytes();
+    } else if (capturedBytes is Uint8List) {
+      bytes = capturedBytes;
+      file = null;
+    } else {
+      return;
+    }
+
+    if (!mounted) return; // 🔥 Prevents setState after dispose
+    setState(() {
+      _isPreviewLoading = true; // start loading preview
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
       setState(() {
         if (isPunchOut) {
-          _punchOutImage = imageFile;
+          _punchOutImage = file;
+          _punchOutImageBytes = bytes;
           _punchOutAddress = address;
         } else {
-          _punchInImage = imageFile;
+          _punchInImage = file;
+          _punchInImageBytes = bytes;
           _punchInAddress = address;
         }
+
+        _isPreviewLoading = false; // preview finished
       });
-    }
+    });
   }
+
 
   Future<void> _getLocation() async {
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) return;
+    if (!serviceEnabled) throw Exception("Location service disabled");
 
     LocationPermission permission = await Geolocator.requestPermission();
-    if (permission == LocationPermission.denied) return;
+
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      throw Exception("Location permission denied");
+    }
 
     Position pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high);
+
     setState(() {
       _position = pos;
     });
-    address = await getAddressFromLatLng(_position!);
+
+    address = await getAddressFromLatLng(pos);
   }
+
+
 
   Future<String> getAddressFromLatLng(Position position) async {
     try {
-      List<Placemark> placemarks = await placemarkFromCoordinates(
-        position.latitude,
-        position.longitude,
-      );
+      // -------------------------
+      // ⭐ WEB → Use Google API
+      // -------------------------
+      if (kIsWeb) {
+        final lat = position.latitude;
+        final lng = position.longitude;
 
-      if (placemarks.isNotEmpty) {
-        final place = placemarks.first;
-        return "${place.name}, ${place.street}, ${place.locality}, ${place.administrativeArea}, ${place.postalCode}, ${place.country}";
-      } else {
-        return "Address not found";
+        const apiKey = "AIzaSyBmCX9ou3KEtNlR6j9ticypDFszy-hh-mU"; // <-- add your key here
+
+        final url = Uri.parse(
+          "https://maps.googleapis.com/maps/api/geocode/json?latlng=$lat,$lng&key=$apiKey",
+        );
+
+        final response = await http.get(url);
+        final data = jsonDecode(response.body);
+
+        if (data["status"] == "OK") {
+          return data["results"][0]["formatted_address"];
+        } else {
+          print("Geocode Response: ${response.body}");
+          return "Address not found (Web)";
+        }
+      }
+      else {
+        // -------------------------
+        // ⭐ MOBILE → Use Plugin
+        // -------------------------
+        final placemarks = await placemarkFromCoordinates(
+          position.latitude,
+          position.longitude,
+        );
+
+        if (placemarks.isEmpty) return "Address not found";
+
+        final p = placemarks.first;
+
+        return [
+          p.name,
+          p.street,
+          p.subLocality,
+          p.locality,
+          p.administrativeArea,
+          p.postalCode,
+          p.country,
+        ]
+            .where((x) => x != null && x!.trim().isNotEmpty)
+            .join(", ");
       }
     } catch (e) {
       return "Error: $e";
     }
   }
+
+
 
   Future<XFile?> compressImage(File file) async {
     final targetPath =
@@ -197,21 +280,47 @@ class _AttendanceFormState extends State<AttendanceForm> {
     if (snap.docs.isNotEmpty) {
       final data = snap.docs.first.data();
       if (!mounted) return;
+
       setState(() {
         _alreadySubmitted = true;
+
+        // Punch in time
         _submittedTime = (data["punchInTime"] as Timestamp).toDate();
+
+        // Punch out time (nullable)
         _punchOutTime = data["punchOutTime"] != null
             ? (data["punchOutTime"] as Timestamp).toDate()
             : null;
+
+        // Late?
         _isLate = data["isLate"] ?? false;
-        if (data["totalHours"] != null) {
-          int mins = data["totalHours"];
-          _totalHours = "${mins ~/ 60}h ${mins % 60}m";
+
+        // TOTAL HOURS LOGIC
+        if (_punchOutTime == null) {
+          // 👈 user has not punched out
+          _totalHours = "-";
+        } else {
+          // 👇 Use DB stored minutes safely
+          int? mins = data["totalHours"];
+          if (mins != null) {
+            _totalHours = "${mins ~/ 60}h ${mins % 60}m";
+          } else {
+            // fallback (rare)
+            final duration = _punchOutTime!.difference(_submittedTime!);
+            final roundedMins = (duration.inSeconds / 60).round();
+            _totalHours =
+            "${roundedMins ~/ 60}h ${roundedMins % 60}m";
+          }
         }
-        _exemptionRequested = (data["exemptionStatus"] == "requested" || data["exemptionStatus"] == "approved");
+
+        // Exemption
+        _exemptionRequested = (data["exemptionStatus"] == "requested" ||
+            data["exemptionStatus"] == "approved");
       });
     }
   }
+
+
   Future<void> _checkExemptionStatus() async {
     if (user == null) return;
 
@@ -234,9 +343,12 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
 
   Future<void> _submitAttendance() async {
-    if (_punchInImage == null || _position == null) {
+    if ((!kIsWeb && _punchInImage == null) ||
+        (kIsWeb && _punchInImageBytes == null) ||
+        _position == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Please take selfie & location")));
+        const SnackBar(content: Text("Please take selfie & location")),
+      );
       return;
     }
 
@@ -249,21 +361,33 @@ class _AttendanceFormState extends State<AttendanceForm> {
       return;
     }
 
-
     setState(() => _loading = true);
 
     try {
-      final compressedSelfie = await compressImage(_punchInImage!);
-      if (compressedSelfie == null) throw Exception("Image compression failed");
+      String selfieUrl = "";
+
+      final userName = await _getUserName(); // Fetch name from Firestore
+      final formattedDate = "${now.year}-${now.month}-${now.day}_${now.hour}-${now.minute}";
+
 
       final ref = FirebaseStorage.instance
           .ref()
-          .child("selfies/punchin_${DateTime.now().millisecondsSinceEpoch}.jpg");
-      File file = File(compressedSelfie.path);
-      await ref.putFile(file);
-      final selfieUrl = await ref.getDownloadURL();
+          .child("selfies/${userName}_PunchIn_$formattedDate.jpg");
 
-      DateTime now = DateTime.now();
+      if (kIsWeb) {
+        // ✅ Upload web bytes directly
+        await ref.putData(_punchInImageBytes!);
+        selfieUrl = await ref.getDownloadURL();
+      } else {
+        // ✅ Compress only on mobile
+        final compressedSelfie = await compressImage(_punchInImage!);
+        if (compressedSelfie == null) throw Exception("Image compression failed");
+
+        File file = File(compressedSelfie.path);
+        await ref.putFile(file);
+        selfieUrl = await ref.getDownloadURL();
+      }
+
       DateTime cutoff = DateTime(now.year, now.month, now.day, 10, 15);
       bool isLate = now.isAfter(cutoff);
 
@@ -294,27 +418,55 @@ class _AttendanceFormState extends State<AttendanceForm> {
     setState(() => _loading = false);
   }
 
+
   Future<void> _punchOut() async {
-    if (_punchOutImage == null || _position == null) {
+    if (_submittedTime == null) {
+      await _checkAttendance();
+      if (_submittedTime == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Punch In missing. Cannot Punch Out.")),
+        );
+        return;
+      }
+    }
+
+    if ((!kIsWeb && _punchOutImage == null) ||
+        (kIsWeb && _punchOutImageBytes == null) ||
+        _position == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Please take selfie & location")));
+        const SnackBar(content: Text("Please take selfie & location")),
+      );
       return;
     }
 
     setState(() => _loading = true);
 
     try {
-      final compressedSelfie = await compressImage(_punchOutImage!);
-      if (compressedSelfie == null) throw Exception("Image compression failed");
+      String selfieUrl = "";
+      final today = DateTime.now();
+      final userName = await _getUserName(); // Fetch name from Firestore
+      final formattedDate = "${today.year}-${today.month}-${today.day}_${today.hour}-${today.minute}";
+
 
       final ref = FirebaseStorage.instance
           .ref()
-          .child("selfies/punchout_${DateTime.now().millisecondsSinceEpoch}.jpg");
-      File file = File(compressedSelfie.path);
-      await ref.putFile(file);
-      final selfieUrl = await ref.getDownloadURL();
+          .child("selfies/${userName}_PunchOut_$formattedDate.jpg");
 
-      final today = DateTime.now();
+      if (kIsWeb) {
+        /// ✅ Web: upload bytes directly
+        await ref.putData(_punchOutImageBytes!);
+        selfieUrl = await ref.getDownloadURL();
+      } else {
+        /// ✅ Mobile: compress and upload file
+        final compressedSelfie = await compressImage(_punchOutImage!);
+        if (compressedSelfie == null) throw Exception("Image compression failed");
+
+        File file = File(compressedSelfie.path);
+        await ref.putFile(file);
+        selfieUrl = await ref.getDownloadURL();
+      }
+
+
       final todayDate = DateTime(today.year, today.month, today.day);
 
       final snap = await FirebaseFirestore.instance
@@ -325,7 +477,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
       if (snap.docs.isNotEmpty) {
         DateTime punchOutTime = DateTime.now();
-        Duration totalHours = punchOutTime.difference(_submittedTime!);
+        final totalHours = punchOutTime.difference(_submittedTime!);
+
+        final int minutes = (totalHours.inSeconds / 60).round();
 
         await FirebaseFirestore.instance
             .collection("attendance")
@@ -336,7 +490,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
           "punchOutLatitude": _position!.latitude,
           "punchOutLongitude": _position!.longitude,
           "punchOutAddress": _punchOutAddress,
-          "totalHours": totalHours.inMinutes,
+          "totalHours": minutes,
         });
 
         setState(() {
@@ -344,8 +498,8 @@ class _AttendanceFormState extends State<AttendanceForm> {
           _totalHours = "${totalHours.inHours}h ${totalHours.inMinutes % 60}m";
         });
 
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Punch Out successful ✅")));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text("Punch Out successful ✅")));
       }
     } catch (e) {
       ScaffoldMessenger.of(context)
@@ -354,6 +508,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
     setState(() => _loading = false);
   }
+
 
   Future<void> _requestExemption() async {
     try {
@@ -421,9 +576,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
         30,
       );
 
-      final totalMinutes =
-      autoPunchOut.difference(punchIn).inMinutes.clamp(0, 24 * 60);
-      //final totalHours = (totalMinutes / 60).floor();
+      final int totalMinutes = (autoPunchOut.difference(punchIn).inSeconds / 60).round();
 
       await doc.reference.update({
         'punchOutTime': Timestamp.fromDate(autoPunchOut),
@@ -444,14 +597,53 @@ class _AttendanceFormState extends State<AttendanceForm> {
   }
 
 
+  Widget buildSelfiePreview(bool isPunchOut) {
+    final bytes = isPunchOut ? _punchOutImageBytes : _punchInImageBytes;
+    if (bytes == null) return const SizedBox.shrink();
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: Image(image: MemoryImage(bytes), width: 150, height: 150, fit: BoxFit.cover, gaplessPlayback: true,),
+    );
+  }
+
+
+
+
   @override
   void initState() {
     super.initState();
     _checkForAutoLogout();
     _checkAttendance();
     _checkExemptionStatus();
-    _checkNoPunchInDay();
+    //_checkNoPunchInDay();
   }
+  Widget _exemptionButton(String exemptionStatus) {
+    String label = "Seek Exemption";
+    Color color = Colors.orange;
+    bool disabled = false;
+
+    if (exemptionStatus == "requested") {
+      label = "Exemption Requested";
+      color = Colors.grey;
+      disabled = true;
+    } else if (exemptionStatus == "approved") {
+      label = "Exempted ✅";
+      color = Colors.grey;
+      disabled = true;
+    }
+
+    return ElevatedButton.icon(
+      onPressed: disabled ? null : _requestExemption,
+      icon: const Icon(Icons.report_problem),
+      label: Text(label),
+      style: ElevatedButton.styleFrom(
+        backgroundColor: color,
+        disabledBackgroundColor: Colors.grey,
+      ),
+    );
+  }
+
 
   // ------------------- Build UI -------------------
 
@@ -488,7 +680,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
                   ),
                 ),
-            /*DrawerHeader(
+                /*DrawerHeader(
             decoration: const BoxDecoration(
             color: Colors.orange,
             ),
@@ -518,7 +710,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
             ),
           ),*/
 
-          /* UserAccountsDrawerHeader(
+                /* UserAccountsDrawerHeader(
                   margin: EdgeInsets.zero,
                   decoration: const BoxDecoration(
                     color: Colors.orange,
@@ -533,7 +725,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
                   ),
                   // Removes extra space from avatar area
                   currentAccountPicture: const SizedBox.shrink(),*/
-               //),
+                //),
                 /*UserAccountsDrawerHeader(
                   accountName: Text(snapshot.data ?? "User"),
                   accountEmail: Text(FirebaseAuth.instance.currentUser?.email ?? ""),
@@ -577,7 +769,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (_message != null)
+                if (_message != null && !_noPunchInNeeded)
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     child: Card(
@@ -607,259 +799,263 @@ class _AttendanceFormState extends State<AttendanceForm> {
                   ),
 
                 if (_noPunchInNeeded)
-                    Card(
-                      color: Colors.orange[100],
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10)),
-                      margin: const EdgeInsets.only(bottom: 16),
-                      child: Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.info_outline, color: Colors.orange),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                _message ?? "No Punch-In needed today.",
-                                style: const TextStyle(
-                                  color: Colors.orange,
-                                  fontWeight: FontWeight.w600,
-                                  fontSize: 16,
-                                ),
+                  Card(
+                    color: Colors.orange[100],
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10)),
+                    margin: const EdgeInsets.only(bottom: 16),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.info_outline, color: Colors.orange),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              _message ?? "No Punch-In needed today.",
+                              style: const TextStyle(
+                                color: Colors.orange,
+                                fontWeight: FontWeight.w600,
+                                fontSize: 16,
                               ),
                             ),
-                          ],
-                        ),
+                          ),
+                        ],
                       ),
-                    )
+                    ),
+                  )
                 else
-                Card(
-                  elevation: 3,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text("Attendance",
-                            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 12),
+                  Card(
+                    elevation: 3,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text("Attendance",
+                              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 12),
 
-                        // Punch In Row
-                        Row(
-                          children: [
-                            const Icon(Icons.login, color: Colors.green),
-                            const SizedBox(width: 8),
-                            Text(
-                              _submittedTime != null
-                                  ? "Punch In: ${DateFormat('dd MMM, hh:mm a').format(_submittedTime!)}"
-                                  : "Punch In: Not yet",
-                            ),
-                          ],
-                        ),
-
-                        if (_isLate)
-                          const Text("⚠️ Late Punch In", style: TextStyle(color: Colors.red)),
-
-                        // Punch In Image & Address
-                        if (_punchInImage != null)
-                          Column(
+                          // Punch In Row
+                          Row(
                             children: [
-                              const SizedBox(height: 8),
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: Image.file(_punchInImage!, height: 120),
+                              const Icon(Icons.login, color: Colors.green),
+                              const SizedBox(width: 8),
+                              Text(
+                                _submittedTime != null
+                                    ? "Punch In: ${DateFormat('dd MMM, hh:mm a').format(_submittedTime!)}"
+                                    : "Punch In: Not yet",
                               ),
-                              const SizedBox(height: 4),
-                              if (_punchInAddress.isNotEmpty)
-                                Text("📍 Address: $_punchInAddress",
-                                    style: const TextStyle(fontSize: 12, color: Colors.grey),
-                                    textAlign: TextAlign.center),
                             ],
                           ),
 
-                        const SizedBox(height: 12),
+                          if (_isLate)
+                            const Text("⚠️ Late Punch In", style: TextStyle(color: Colors.red)),
 
-                        // Punch Out Row
-                        Row(
-                          children: [
-                            const Icon(Icons.logout, color: Colors.red),
-                            const SizedBox(width: 8),
-                            Text(
-                              _punchOutTime != null
-                                  ? "Punch Out: ${DateFormat('dd MMM, hh:mm a').format(_punchOutTime!)}"
-                                  : "Punch Out: Not yet",
-                            ),
-                          ],
-                        ),
-
-                        // ✅ Calculate total working hours
-                        Builder(builder: (context) {
-                          if (_submittedTime != null && _punchOutTime != null) {
-                            final duration = _punchOutTime!.difference(_submittedTime!);
-                            final hours = duration.inHours;
-                            final minutes = duration.inMinutes.remainder(60);
-                            final totalHours = "$hours h $minutes m";
-
-                            bool isShortDay = hours < 9;
-
-                            return Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
+                          // Punch In Image & Address
+                          if (_punchInImage != null || (kIsWeb && _punchInImageBytes != null))
+                            Column(
                               children: [
                                 const SizedBox(height: 8),
-                                Row(
-                                  children: [
-
-                                    Text("Total Hours: ",
-                                        style: TextStyle(
-                                          fontWeight: FontWeight.bold)),
-                                    if (isShortDay)
-                                      const Padding(
-                                        padding: EdgeInsets.only(left: 6),
-                                        child: Icon(Icons.access_time_filled, color: Colors.red, size: 18),
-                                      ),
-
-                                    Text(" $totalHours (Half Day)",
-                                        style: TextStyle(
-                                          fontWeight: FontWeight.bold,
-                                          fontSize: 15,
-                                          color: isShortDay ? Colors.red : Colors.black,
-                                        )),
-
-
-                                  ],
-                                ),
-                                if (isShortDay)
-                                  Padding(
-                                    padding: const EdgeInsets.only(top: 8),
-                                    child: FutureBuilder<DocumentSnapshot?>(
-                                      future: () async {
-                                        final snap = await FirebaseFirestore.instance
-                                            .collection("attendance")
-                                            .where("userId", isEqualTo: user?.uid)
-                                            .where(
-                                          "punchInDate",
-                                          isEqualTo: DateTime(
-                                            _submittedTime!.year,
-                                            _submittedTime!.month,
-                                            _submittedTime!.day,
-                                          ),
-                                        )
-                                            .limit(1)
-                                            .get();
-
-                                        if (snap.docs.isNotEmpty) {
-                                          return await snap.docs.first.reference.get();
-                                        }
-                                        return null;
-                                      }(),
-                                      builder: (context, snapshot) {
-                                        if (!snapshot.hasData) {
-                                          return const SizedBox.shrink();
-                                        }
-
-                                        final doc = snapshot.data;
-                                        String exemptionStatus = "none";
-                                        if (doc != null && doc.exists && doc.data() != null) {
-                                          final data = doc.data() as Map<String, dynamic>;
-                                          exemptionStatus = data["exemptionStatus"] ?? "none";
-                                        }
-
-                                        String label = "Seek Exemption";
-                                        Color color = Colors.orange;
-                                        bool disabled = false;
-
-                                        if (exemptionStatus == "requested") {
-                                          label = "Exemption Requested";
-                                          color = Colors.grey;
-                                          disabled = true;
-                                        } else if (exemptionStatus == "approved") {
-                                          label = "Exempted ✅";
-                                          color = Colors.grey;
-                                          disabled = true;
-                                        }
-
-                                        return ElevatedButton.icon(
-                                          onPressed: disabled ? null : _requestExemption,
-                                          icon: const Icon(Icons.report_problem),
-                                          label: Text(label),
-                                          style: ElevatedButton.styleFrom(
-                                            backgroundColor: color,
-                                            disabledBackgroundColor: Colors.grey,
-                                          ),
-                                        );
-                                      },
-                                    ),
+                                buildSelfiePreview(false),  // Punch In
+                                const SizedBox(height: 4),
+                                if (_punchInAddress.isNotEmpty)
+                                  Text(
+                                    "📍 Address: $_punchInAddress",
+                                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                                    textAlign: TextAlign.center,
                                   ),
                               ],
-                            );
-                          } else {
-                            return const SizedBox.shrink();
-                          }
-                        }),
+                            ),
 
-                        // Punch Out Image & Address
-                        if (_punchOutImage != null)
-                          Column(
+                          const SizedBox(height: 12),
+
+                          // Punch Out Row
+                          Row(
                             children: [
-                              const SizedBox(height: 8),
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: Image.file(_punchOutImage!, height: 120),
+                              const Icon(Icons.logout, color: Colors.red),
+                              const SizedBox(width: 8),
+                              Text(
+                                _punchOutTime != null
+                                    ? "Punch Out: ${DateFormat('dd MMM, hh:mm a').format(_punchOutTime!)}"
+                                    : "Punch Out: Not yet",
                               ),
-                              const SizedBox(height: 4),
-                              if (_punchOutAddress.isNotEmpty)
-                                Text("📍 Address: $_punchOutAddress",
-                                    style: const TextStyle(fontSize: 12, color: Colors.grey),
-                                    textAlign: TextAlign.center),
                             ],
                           ),
 
-                        const SizedBox(height: 12),
+                          // ✅ Calculate total working hours
+                            Builder(
+                            builder: (context) {
+        if (_submittedTime != null && _punchOutTime != null) {
+        final duration = _punchOutTime!.difference(_submittedTime!);
+        final totalMinutes = (duration.inSeconds / 60).round();
+        final hours = totalMinutes ~/ 60;
+        final minutes = totalMinutes % 60;
+        final totalHours = "$hours h ${minutes.toString().padLeft(2, '0')} m";
 
-                        // Buttons
-                        if (!_alreadySubmitted)
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton.icon(
-                              onPressed: () => _captureSelfie(isPunchOut: false),
-                              icon: const Icon(Icons.camera_alt),
-                              label: const Text("Capture Selfie"),
+        return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+        const SizedBox(height: 8),
+
+        FutureBuilder<DocumentSnapshot?>(
+        future: () async {
+        final snap = await FirebaseFirestore.instance
+            .collection("attendance")
+            .where("userId", isEqualTo: user?.uid)
+            .where(
+        "punchInDate",
+        isEqualTo: DateTime(
+        _submittedTime!.year,
+        _submittedTime!.month,
+        _submittedTime!.day,
+        ),
+        )
+            .limit(1)
+            .get();
+
+        if (snap.docs.isNotEmpty) {
+        return snap.docs.first.reference.get();
+        }
+        return null;
+        }(),
+        builder: (context, snapshot) {
+        String exemptionStatus = "none";
+        if (snapshot.hasData &&
+        snapshot.data != null &&
+        snapshot.data!.exists &&
+        snapshot.data!.data() != null) {
+        final docData = snapshot.data!.data() as Map<String, dynamic>;
+        exemptionStatus = docData["exemptionStatus"] ?? "none";
+        }
+
+        final bool isExemptApproved = exemptionStatus == "approved";
+        final bool isShortDay = hours < 9;
+
+        // DECIDE TEXT
+        String displayText =
+        isExemptApproved ? totalHours : (isShortDay ? "$totalHours (Half Day)" : totalHours);
+
+        // DECIDE COLOR
+        Color textColor = isExemptApproved
+        ? Colors.green
+            : (isShortDay ? Colors.red : Colors.black);
+
+        // DECIDE ICON
+        Icon icon = Icon(
+          isExemptApproved
+              ? Icons.verified_user     // GREEN approved
+              : Icons.access_time_filled,
+        color: isExemptApproved ? Colors.green : Colors.red,
+        size: 18,
+        );
+
+        return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+        Row(
+        children: [
+        Text(
+        "Total Hours: ",
+        style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+
+        if (isShortDay || isExemptApproved)
+        Padding(
+        padding: const EdgeInsets.only(left: 6),
+        child: icon,
+        ),
+
+        Text(
+        " $displayText",
+        style: TextStyle(
+        fontWeight: FontWeight.bold,
+        fontSize: 15,
+        color: textColor,
+        ),
+        ),
+        ],
+        ),
+
+        if (isShortDay) ...[
+        const SizedBox(height: 8),
+        _exemptionButton(exemptionStatus),
+        ]
+        ],
+        );
+        },
+        ),
+        ],
+        );
+        }
+        return const SizedBox.shrink();
+        },
                             ),
-                          ),
-                        if (!_alreadySubmitted)
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton(
-                              onPressed: _loading ? null : _submitAttendance,
-                              child: _loading
-                                  ? const CircularProgressIndicator(color: Colors.white)
-                                  : const Text("Punch In"),
+
+
+        // Punch Out Image & Address
+                          if (_punchOutImage != null || (kIsWeb && _punchOutImageBytes != null))
+                            Column(
+                              children: [
+                                const SizedBox(height: 8),
+                                buildSelfiePreview(true),  // Punch Out
+                                const SizedBox(height: 4),
+                                if (_punchOutAddress.isNotEmpty)
+                                  Text(
+                                    "📍 Address: $_punchOutAddress",
+                                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                                    textAlign: TextAlign.center,
+                                  ),
+                              ],
                             ),
-                          ),
-                        if (_alreadySubmitted && _punchOutTime == null)
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton.icon(
-                              onPressed: () => _captureSelfie(isPunchOut: true),
-                              icon: const Icon(Icons.camera_alt),
-                              label: const Text("Capture Selfie"),
+
+
+                          const SizedBox(height: 12),
+
+                          // Buttons
+                          if (!_alreadySubmitted)
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton.icon(
+                                onPressed: () => _captureSelfie(isPunchOut: false),
+                                icon: const Icon(Icons.camera_alt),
+                                label: const Text("Capture Selfie"),
+                              ),
                             ),
-                          ),
-                        if (_alreadySubmitted && _punchOutTime == null)
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton(
-                              onPressed: _loading ? null : _punchOut,
-                              child: _loading
-                                  ? const CircularProgressIndicator(color: Colors.white)
-                                  : const Text("Punch Out"),
+                          if (!_alreadySubmitted)
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton(
+                                onPressed: (_loading || _isPreviewLoading) ? null : _submitAttendance,
+                                child: _loading
+                                    ? const CircularProgressIndicator(color: Colors.white)
+                                    : const Text("Punch In"),
+                              ),
                             ),
-                          ),
-                      ],
+                          if (_alreadySubmitted && _punchOutTime == null)
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton.icon(
+                                onPressed: () => _captureSelfie(isPunchOut: true),
+                                icon: const Icon(Icons.camera_alt),
+                                label: const Text("Capture Selfie"),
+                              ),
+                            ),
+                          if (_alreadySubmitted && _punchOutTime == null)
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton(
+                                onPressed: (_loading || _isPreviewLoading) ? null : _punchOut,
+                                child: _loading
+                                    ? const CircularProgressIndicator(color: Colors.white)
+                                    : const Text("Punch Out"),
+                              ),
+                            ),
+                        ],
+                      ),
                     ),
                   ),
-                ),
               ],
             ),
           ),
