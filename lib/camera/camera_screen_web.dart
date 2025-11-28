@@ -87,10 +87,14 @@ class _CameraScreenState extends State<CameraScreen> {
               height: 450,
               child: HtmlElementView(viewType: viewId),
             ),
-            ElevatedButton(
+            FloatingActionButton(
+              onPressed: _capture,
+              child: const Icon(Icons.camera_alt),
+            ),
+           /* ElevatedButton(
               onPressed: _capture,
               child: const Text("Capture"),
-            ),
+            ),*/
           ],
         ),
       ),

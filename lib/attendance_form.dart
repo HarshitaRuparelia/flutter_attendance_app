@@ -9,6 +9,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter/foundation.dart';
 import 'attendance_history_screen.dart';
+import 'auth_page.dart';
 import 'leave_screen.dart';
 import 'dart:io' show File;
 import 'dart:convert';
@@ -174,33 +175,81 @@ class _AttendanceFormState extends State<AttendanceForm> {
   }
 
   Future<void> _getLocation() async {
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) throw Exception("Location service disabled");
+    try {
+      // Check if service is enabled
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Please enable location services.")),
+        );
+        return;
+      }
 
-    LocationPermission permission = await Geolocator.requestPermission();
+      // Request permission
+      LocationPermission permission = await Geolocator.checkPermission();
 
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      throw Exception("Location permission denied");
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Location permission denied. Please enable it."),
+          ),
+        );
+        return;
+      }
+
+      Position pos;
+      Position? cached;
+      if (kIsWeb) {
+         pos =  await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.bestForNavigation,
+        );
+      }
+      else {
+        // FIRST: Get last known location (faster + often accurate)
+        cached = await Geolocator.getLastKnownPosition();
+
+        // THEN: Get fresh GPS location
+        pos = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.bestForNavigation,
+          timeLimit: const Duration(seconds: 12),
+        );
+      }
+
+      // Select the best accuracy
+      Position best;
+      if (cached != null && cached.accuracy < pos.accuracy) {
+        best = cached;
+      } else {
+        best = pos;
+      }
+
+      if (!mounted) return;
+
+      setState(() => _position = best);
+
+      // Reverse geocode
+      address = await getAddressFromLatLng(best);
+
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Failed to get location: $e")),
+      );
     }
-
-    Position pos = await Geolocator.getCurrentPosition(
-      desiredAccuracy: LocationAccuracy.high,
-    );
-
-    setState(() {
-      _position = pos;
-    });
-
-    address = await getAddressFromLatLng(pos);
   }
+
+
 
   Future<String> getAddressFromLatLng(Position position) async {
     try {
       // -------------------------
       // ⭐ WEB → Use Google API
       // -------------------------
-      if (kIsWeb) {
+    //  if (kIsWeb) {
         final lat = position.latitude;
         final lng = position.longitude;
 
@@ -220,7 +269,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
           print("Geocode Response: ${response.body}");
           return "Address not found (Web)";
         }
-      } else {
+      // } else {
         // -------------------------
         // ⭐ MOBILE → Use Plugin
         // -------------------------
@@ -234,15 +283,16 @@ class _AttendanceFormState extends State<AttendanceForm> {
         final p = placemarks.first;
 
         return [
-          p.name,
-          p.street,
-          p.subLocality,
-          p.locality,
-          p.administrativeArea,
-          p.postalCode,
-          p.country,
-        ].where((x) => x != null && x!.trim().isNotEmpty).join(", ");
-      }
+          p.name,               // building / landmark name
+          p.street,             // road
+          p.subLocality,        // locality / area
+          p.locality,           // city
+          p.administrativeArea, // state
+          p.postalCode,         // pin code
+          p.country,            // country
+        ].where((x) => x != null && x!.trim().isNotEmpty).toSet() // removes duplicates automatically
+        .join(", ");
+      // }
     } catch (e) {
       return "Error: $e";
     }
@@ -707,10 +757,10 @@ class _AttendanceFormState extends State<AttendanceForm> {
     return FutureBuilder<String>(
       future: _getUserName(),
       builder: (context, snapshot) {
-        String title = "Attendance Monitoring System";
+        String title = "";
         if (snapshot.connectionState == ConnectionState.done &&
             snapshot.hasData) {
-          title = "Welcome ${snapshot.data}";
+          title = "${snapshot.data}";
         }
 
         return Scaffold(
@@ -772,7 +822,15 @@ class _AttendanceFormState extends State<AttendanceForm> {
                 ListTile(
                   leading: const Icon(Icons.logout, color: Colors.red),
                   title: const Text("Logout"),
-                  onTap: () => FirebaseAuth.instance.signOut(),
+                  onTap: () {
+                    FirebaseAuth.instance.signOut();
+                    Navigator.pop(context);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => const AuthPage()),
+                    );
+                  },
+                 // onTap: () => FirebaseAuth.instance.signOut(),
                 ),
               ],
             ),
