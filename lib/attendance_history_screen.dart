@@ -476,6 +476,7 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
                                     final exemptionStatus = data['exemptionStatus'] ;
                                     final punchInUrl = data['punchInSelfieUrl'];
                                     final punchOutUrl = data['punchOutSelfieUrl'];
+                                    bool isAutoLogout = data['autoLogout']== true;
 
                                     // 👉 CORRECT: Use "-" when no punch out
                                     String totalHoursStr;
@@ -525,17 +526,27 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
                                             ),
                                           ),
                                         ),
-                                        DataCell(
-                                          Text(
-                                            punchOut != null
-                                                ? DateFormat(
-                                                    'hh:mm a',
-                                                  ).format(punchOut)
-                                                : '-',
-                                          ),
-                                        ),
+                                  DataCell(
+                                  Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+                                  decoration: BoxDecoration(
+                                  color: isAutoLogout ? Colors.red.withOpacity(0.15) : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(
+                                  punchOut != null
+                                      ? "${DateFormat('hh:mm a').format(punchOut)}${isAutoLogout ? ' \n(Auto punch-out)' : ''}"
+                                      : '-',
+                                  style: TextStyle(
+                                 // color: isAutoLogout ? Colors.red : Colors.black,
+                                  fontWeight: isAutoLogout ? FontWeight.bold : FontWeight.normal,
+                                  ),
+                                  ),
+                                  ),
+                                  ),
 
-                                        // ✅ Total Hours Column with Half-Day logic
+
+                                  // ✅ Total Hours Column with Half-Day logic
                                   DataCell(
                                   isHalfDay
                                   ? (exemptionStatus == "approved"

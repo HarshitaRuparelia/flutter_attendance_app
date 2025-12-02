@@ -7,6 +7,7 @@ import 'attendance_form.dart';
 import 'auth_page.dart';
 import 'email_verification.dart';
 import 'firebase_options.dart';
+import 'logger.dart';
 
 /// Notifications plugin (Mobile only)
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -32,7 +33,6 @@ Future<void> initNotifications() async {
 }
 
 Future<void> onNotificationResponse(NotificationResponse response) async {
-  print("onNotificationResponse");
   final uid = FirebaseAuth.instance.currentUser?.uid;
   if (uid == null) return;
 
@@ -52,6 +52,7 @@ Future<void> onNotificationResponse(NotificationResponse response) async {
       "lastNotificationAction": now,
       "lastAction": "notification_clicked",
     });
+    AppLogger.log(event: "Notification clicked", uid: uid);
     return;
   }
 
@@ -62,10 +63,10 @@ Future<void> onNotificationResponse(NotificationResponse response) async {
       "lastNotificationAction": now,
       "lastAction": "pressed_done_button",
     });
+    AppLogger.log(event: "Pressed done button", uid: uid);
     return;
   }
 }
-
 
 
 void main() async {
@@ -74,15 +75,11 @@ void main() async {
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
+  //AppLogger.log(event: "App Launched");
 
   // 🟠 Initialize notifications ONLY on mobile
   if (!kIsWeb) {
     initNotifications();
-   /* const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
-    const iosInit = DarwinInitializationSettings();
-    const settings = InitializationSettings(android: androidInit, iOS: iosInit);
-    await flutterLocalNotificationsPlugin.initialize(settings,
-        onDidReceiveNotificationResponse: onNotificationResponse);*/
   }
 
   runApp(const MyApp());
@@ -140,10 +137,15 @@ class _MyAppState extends State<MyApp> {
           final user = FirebaseAuth.instance.currentUser;
 
           if (pendingVerificationUser != null) {
+            AppLogger.log(
+              event: "Opened EmailVerificationPage",
+              uid: pendingVerificationUser!.uid,
+            );
             return EmailVerificationPage(user: pendingVerificationUser!);
           }
 
           if (user != null && user.emailVerified) {
+            AppLogger.log(event: "User logged in", uid: user.uid);
             if (!kIsWeb) scheduleDailyAttendanceReminder();
             return const AttendanceForm();
           }
@@ -164,99 +166,118 @@ Future<void> scheduleDailyAttendanceReminder() async {
   tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
 
   final uid = FirebaseAuth.instance.currentUser?.uid;
-  if (uid == null) return;
-
-  final today = DateTime.now();
-  final dateStr =
-      "${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}";
-
-  final firestore = FirebaseFirestore.instance;
-
-  // 1️⃣ Skip Sunday
-  if (today.weekday == DateTime.sunday) return;
-
-  // 2️⃣ Skip 2nd & 4th Saturday
-  if (today.weekday == DateTime.saturday) {
-    int count = 0;
-    for (int i = 1; i <= today.day; i++) {
-      if (DateTime(today.year, today.month, i).weekday == DateTime.saturday) {
-        count++;
-      }
-    }
-    if (count == 2 || count == 4) return;
+  if (uid == null) {
+    AppLogger.log(event: "Reminder: No user logged in → Skipping", uid: "NO_USER");
+    return;
   }
+    AppLogger.log(event: "scheduleDailyAttendanceReminder(): Started", uid: uid);
+      final today = DateTime.now();
+      final dateStr =
+          "${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}";
 
-  // 3️⃣ Holiday check
-  final holidayDoc = await firestore.collection('holidays').doc(dateStr).get();
-  if (holidayDoc.exists) return;
+      final firestore = FirebaseFirestore.instance;
 
-  // 4️⃣ Leave check
-  final leaves = await firestore
-      .collection('leaves')
-      .where('userId', isEqualTo: uid)
-      .where('status', isEqualTo: 'Approved')
-      .get();
+      // 1️⃣ Skip Sunday
+      if (today.weekday == DateTime.sunday) {
+        AppLogger.log(event: "Reminder: Sunday → Skipped", uid: uid);
+        return;
+      }
 
-  for (var l in leaves.docs) {
-    final start = (l['startDate'] as Timestamp).toDate();
-    final end = (l['endDate'] as Timestamp).toDate();
+      // 2️⃣ Skip 2nd & 4th Saturday
+      if (today.weekday == DateTime.saturday) {
+        int count = 0;
+        for (int i = 1; i <= today.day; i++) {
+          if (DateTime(today.year, today.month, i).weekday == DateTime.saturday) {
+            count++;
+          }
+        }
+        if (count == 2 || count == 4) {
+          AppLogger.log(
+            event: "Reminder: ${count == 2 ? "2nd" : "4th"} Saturday → Skipped",
+            uid: uid,
+          );
+          return;
+        }
+      }
+
+      // 3️⃣ Holiday check
+      final holidayDoc = await firestore.collection('holidays').doc(dateStr).get();
+      if (holidayDoc.exists) {
+        AppLogger.log(
+          event: "Reminder: Today is a Holiday → Skipped",
+          uid: uid,
+        );
+        return;
+      }
+
+      // 4️⃣ Leave check
+      final leaves = await firestore
+          .collection('leaves')
+          .where('userId', isEqualTo: uid)
+          .where('status', isEqualTo: 'Approved')
+          .get();
+
+  bool onLeaveToday = false;
+  for (var doc in leaves.docs) {
+    final start = (doc["startDate"] as Timestamp).toDate();
+    final end = (doc["endDate"] as Timestamp).toDate();
 
     if (!today.isBefore(start) && !today.isAfter(end)) {
-      return;
+      onLeaveToday = true;
+      AppLogger.log(
+        event: "Reminder: User on leave today → Skipped",
+        uid: uid,
+      );
+      break;
     }
   }
 
-  // Notification config
-  const androidDetails = AndroidNotificationDetails(
-    'attendance_reminder_channel',
-    'Attendance Reminder',
-    importance: Importance.max,
-    priority: Priority.high,
-    actions: [
-      AndroidNotificationAction(
-        'DISMISS_ACTION',
-        'I’m Done ✅',
-        showsUserInterface: true,
-        cancelNotification: true,
-      ),
-    ],
-  );
+  if (onLeaveToday) return;
 
-  const details = NotificationDetails(android: androidDetails);
+      // Notification config
+      const androidDetails = AndroidNotificationDetails(
+        'attendance_reminder_channel',
+        'Attendance Reminder',
+        importance: Importance.max,
+        priority: Priority.high,
+        actions: [
+          AndroidNotificationAction(
+            'DISMISS_ACTION',
+            'I’m Done ✅',
+            showsUserInterface: true,
+            cancelNotification: true,
+          ),
+        ],
+      );
 
-  final now = tz.TZDateTime.now(tz.local);
-  var scheduleTime = tz.TZDateTime(tz.local, now.year, now.month, now.day, 10);
-  // for testing
- // var scheduleTime = now.add(const Duration(minutes: 1));
-  // If it's already past 10 AM: remind next day
-  if (scheduleTime.isBefore(now)) {
-    scheduleTime = scheduleTime.add(const Duration(days: 1));
-  }
+      const details = NotificationDetails(android: androidDetails);
 
-  // ❗ DO NOT cancel all notifications → allows tomorrow's reminder
-  await flutterLocalNotificationsPlugin.zonedSchedule(
-    101, // use a consistent ID
-    'Attendance Reminder',
-    'Please mark your attendance 📸',
-    scheduleTime,
-    details,
-    uiLocalNotificationDateInterpretation:
-    UILocalNotificationDateInterpretation.absoluteTime,
-    androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
-    matchDateTimeComponents: DateTimeComponents.time, // 🔥 repeats daily
+      final now = tz.TZDateTime.now(tz.local);
+      var scheduleTime = tz.TZDateTime(tz.local, now.year, now.month, now.day, 10);
+      // for testing
+      // var scheduleTime = now.add(const Duration(minutes: 1));
+      // If it's already past 10 AM: remind next day
+      if (scheduleTime.isBefore(now)) {
+        scheduleTime = scheduleTime.add(const Duration(days: 1));
+      }
+
+      // ❗ DO NOT cancel all notifications → allows tomorrow's reminder
+      await flutterLocalNotificationsPlugin.zonedSchedule(
+        101, // use a consistent ID
+        'Attendance Reminder',
+        'Please mark your attendance 📸',
+        scheduleTime,
+        details,
+        uiLocalNotificationDateInterpretation:
+        UILocalNotificationDateInterpretation.absoluteTime,
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+        matchDateTimeComponents: DateTimeComponents.time, // 🔥 repeats daily
+      );
+  AppLogger.log(
+    event:
+    "Reminder Scheduled for: ${scheduleTime.toString()}",
+    uid: uid,
   );
 }
 
-
-// class AttendanceApp extends StatelessWidget {
-//   const AttendanceApp({super.key});
-//
-//   @override
-//   Widget build(BuildContext context) {
-//     return const Scaffold(
-//       body: AttendanceForm(),
-//     );
-//   }
-// }
-/// 🧍 Authentication page (your existing AuthPage)
 

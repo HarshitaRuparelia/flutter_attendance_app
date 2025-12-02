@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'email_verification.dart';
 import 'attendance_form.dart';
 import 'forgot_password_page.dart';
+import 'logger.dart';
 
 class AuthPage extends StatefulWidget {
   const AuthPage({super.key});
@@ -60,6 +61,10 @@ class _AuthPageState extends State<AuthPage> {
         "name": name,
         "createdAt": FieldValue.serverTimestamp(),
       });
+      AppLogger.log(event: "Signup Success and mail sent ", uid: user.uid, data: {
+        "email": email,
+        "name": name,
+      });
       await user.sendEmailVerification();   // ← REQUIRED
 
       // 3️⃣ Navigate to Email Verification Page
@@ -70,6 +75,11 @@ class _AuthPageState extends State<AuthPage> {
       );
 
     } catch (e) {
+      AppLogger.log(event: "Signup Failed", data: {
+        "email": email,
+        "name": name,
+        "error": e.toString(),
+      });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(cleanErrorMessage(e))),
       );
@@ -113,6 +123,9 @@ class _AuthPageState extends State<AuthPage> {
     try {
       if (isLogin) {
         // LOGIN
+        AppLogger.log(event: "Login Attempt", data: {
+          "email": email,
+        });
         final userCredential =
         await FirebaseAuth.instance.signInWithEmailAndPassword(
           email: email,
@@ -134,15 +147,24 @@ class _AuthPageState extends State<AuthPage> {
         }
 
         if (!mounted) return;
+        AppLogger.log(event: "Login Success", uid: user.uid);
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(builder: (_) => const AttendanceForm()),
         );
       } else {
+        AppLogger.log(event: "Signup Attempt", data: {
+          "email": email,
+          "name": name,
+        });
         // SIGNUP
         await signupUser(email, password, name);
       }
     } catch (e) {
+      AppLogger.log(event: "Login Failed", data: {
+        "email": email,
+        "error": e.toString(),
+      });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(cleanErrorMessage(e))),
       );
@@ -246,6 +268,9 @@ class _AuthPageState extends State<AuthPage> {
                           alignment: Alignment.centerRight,
                           child: TextButton(
                             onPressed: () {
+                              AppLogger.log(event: "Forgot Password Clicked", data: {
+                                "email_field": _emailController.text.trim(),
+                              });
                               Navigator.push(
                                 context,
                                 MaterialPageRoute(builder: (_) => const ForgotPasswordPage()),
@@ -275,7 +300,10 @@ class _AuthPageState extends State<AuthPage> {
                       ),
                       const SizedBox(height: 16),
                       TextButton(
-                        onPressed: () => setState(() => isLogin = !isLogin),
+                      onPressed: () {
+                        AppLogger.log(event: isLogin ? "Go to Signup" : "Go to Login");
+                         setState(() => isLogin = !isLogin);
+                        },
                         child: Text(
                           isLogin
                               ? "Don't have an account? Sign Up"

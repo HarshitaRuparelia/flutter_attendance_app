@@ -15,6 +15,7 @@ import 'dart:io' show File;
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'camera_screen_wrapper.dart';
+import 'logger.dart';
 
 class AttendanceForm extends StatefulWidget {
   const AttendanceForm({super.key});
@@ -61,6 +62,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
   }
 
   Future<void> _checkNoPunchInDay() async {
+    AppLogger.log(event: "_checkNoPunchInDay() called ", uid: user!.uid);
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
 
@@ -77,6 +79,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
         DateTime checkDay = DateTime(now.year, now.month, d);
         if (checkDay.weekday == DateTime.saturday) saturdayCount++;
       }
+      AppLogger.log(event: "Saturday count this month so far: $saturdayCount", uid: user!.uid);
       if (saturdayCount == 2 || saturdayCount == 4) {
         reason =
             "No Punch-In needed today — It's ${saturdayCount == 2 ? "2nd" : "4th"} Saturday (Holiday).";
@@ -120,6 +123,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
     // ✅ Final state update
     if (reason != null) {
+      AppLogger.log(event: "$reason" , uid: user!.uid);
       setState(() {
         _noPunchInNeeded = true;
         _message = reason;
@@ -130,13 +134,25 @@ class _AttendanceFormState extends State<AttendanceForm> {
   Future<void> _captureSelfie({required bool isPunchOut}) async {
     print("_captureSelfie new");
 
+    AppLogger.log(event: "_captureSelfie() called ", uid: user!.uid);
+
     final capturedBytes = await Navigator.push(
       context,
       MaterialPageRoute(builder: (_) => CameraScreenWrapper()),
     );
     print("_captureSelfie result = $capturedBytes");
 
-    if (capturedBytes == null) return;
+    if (capturedBytes == null) {
+      AppLogger.log(
+        event: "capturedBytes== null No image captured - user cancelled camera",
+        uid: user!.uid,
+      );
+      return;
+    }
+    AppLogger.log(
+      event: "Fetching device location",
+      uid: user!.uid,
+    );
     await _getLocation();
 
     Uint8List bytes;
@@ -163,10 +179,18 @@ class _AttendanceFormState extends State<AttendanceForm> {
           _punchOutImage = file;
           _punchOutImageBytes = bytes;
           _punchOutAddress = address;
+          AppLogger.log(
+            event: "Punch OUT image set | Address: $_punchOutAddress",
+            uid: user!.uid,
+          );
         } else {
           _punchInImage = file;
           _punchInImageBytes = bytes;
           _punchInAddress = address;
+          AppLogger.log(
+            event: "Punch IN image set | Address: $_punchOutAddress",
+            uid: user!.uid,
+          );
         }
 
         _isPreviewLoading = false; // preview finished
@@ -177,8 +201,10 @@ class _AttendanceFormState extends State<AttendanceForm> {
   Future<void> _getLocation() async {
     try {
       // Check if service is enabled
+      AppLogger.log(event: "_getLocation called", uid: user!.uid);
       bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
+        AppLogger.log(event: "Location Service Disabled", uid: user!.uid);
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Please enable location services.")),
         );
@@ -194,6 +220,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
       if (permission == LocationPermission.denied ||
           permission == LocationPermission.deniedForever) {
+        AppLogger.log(event: "Location Permission Permanently Denied", uid: user!.uid);
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text("Location permission denied. Please enable it."),
@@ -221,12 +248,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
       }
 
       // Select the best accuracy
-      Position best;
-      if (cached != null && cached.accuracy < pos.accuracy) {
-        best = cached;
-      } else {
-        best = pos;
-      }
+      final best = (cached != null && cached.accuracy < pos.accuracy)
+          ? cached
+          : pos;
 
       if (!mounted) return;
 
@@ -236,6 +260,11 @@ class _AttendanceFormState extends State<AttendanceForm> {
       address = await getAddressFromLatLng(best);
 
     } catch (e) {
+      AppLogger.log(
+        event: "_getLocation() Exception***",
+        uid: user!.uid,
+        data: {"error": e.toString()},
+      );
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("Failed to get location: $e")),
       );
@@ -294,6 +323,11 @@ class _AttendanceFormState extends State<AttendanceForm> {
         .join(", ");
       // }
     } catch (e) {
+      AppLogger.log(
+        event: "getAddressFromLatLng Exception",
+        uid: user!.uid,
+        data: {"error": e.toString()},
+      );
       return "Error: $e";
     }
   }
@@ -313,6 +347,10 @@ class _AttendanceFormState extends State<AttendanceForm> {
   }
 
   Future<void> _checkAttendance() async {
+    AppLogger.log(
+      event: "_checkAttendance() called",
+      uid: user!.uid,
+    );
     final today = DateTime.now();
     final todayDate = DateTime(today.year, today.month, today.day);
 
@@ -363,6 +401,12 @@ class _AttendanceFormState extends State<AttendanceForm> {
             data["exemptionStatus"] == "approved");
       });
     }
+    else {
+      AppLogger.log(
+        event: "_checkAttendance() No attendance record found for today",
+        uid: user!.uid,
+      );
+    }
   }
 
   Future<void> _checkExemptionStatus() async {
@@ -390,10 +434,25 @@ class _AttendanceFormState extends State<AttendanceForm> {
     }
   }
 
-  Future<void> _submitAttendance() async {
+  Future<void> _punchIn() async {
+    AppLogger.log(
+      event: "_punchIn() called",
+      uid: user?.uid,
+    );
     if ((!kIsWeb && _punchInImage == null) ||
         (kIsWeb && _punchInImageBytes == null) ||
         _position == null) {
+      AppLogger.log(
+        event: "PunchIn failed - selfie or location missing",
+        uid: user?.uid,
+        data: {
+          "hasImage": kIsWeb
+              ? _punchInImageBytes != null
+              : _punchInImage != null,
+          "hasLocation": _position != null,
+        },
+      );
+
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Please take selfie & location")),
       );
@@ -403,6 +462,15 @@ class _AttendanceFormState extends State<AttendanceForm> {
     DateTime now = DateTime.now();
     DateTime allowedTime = DateTime(now.year, now.month, now.day, 9, 0);
     if (now.isBefore(allowedTime)) {
+      AppLogger.log(
+        event: "Punch In allowed only after 9:00 AM",
+        uid: user?.uid,
+        data: {
+          "currentTime": now.toString(),
+          "allowedTime": allowedTime.toString(),
+        },
+      );
+
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Punch In allowed only after 9:00 AM")),
       );
@@ -423,6 +491,11 @@ class _AttendanceFormState extends State<AttendanceForm> {
       );
 
       if (kIsWeb) {
+        AppLogger.log(
+          event: "Uploading punch-in selfie (web)",
+          uid: user?.uid,
+        );
+
         // ✅ Upload web bytes directly
         await ref.putData(_punchInImageBytes!);
         selfieUrl = await ref.getDownloadURL();
@@ -436,7 +509,11 @@ class _AttendanceFormState extends State<AttendanceForm> {
         await ref.putFile(file);
         selfieUrl = await ref.getDownloadURL();
       }
-
+      AppLogger.log(
+        event: "Selfie uploaded successfully",
+        uid: user?.uid,
+        data: {"selfieUrl": selfieUrl},
+      );
       DateTime cutoff = DateTime(now.year, now.month, now.day, 10, 15);
       bool isLate = now.isAfter(cutoff);
 
@@ -449,6 +526,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
         "punchInDate": DateTime(now.year, now.month, now.day),
         "punchInSelfieUrl": selfieUrl,
         "isLate": isLate,
+        'punchOutTime': null,
       });
 
       setState(() {
@@ -457,10 +535,21 @@ class _AttendanceFormState extends State<AttendanceForm> {
         _isLate = isLate;
       });
 
+      AppLogger.log(
+        event: "Punch In successful",
+        uid: user?.uid,
+      );
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text("Punch In successful ✅")));
     } catch (e) {
+      AppLogger.log(
+        event: "PunchIn ERROR",
+        uid: user?.uid,
+        data: {
+          "error": e.toString(),
+        },
+      );
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text("Error: $e")));
@@ -470,9 +559,17 @@ class _AttendanceFormState extends State<AttendanceForm> {
   }
 
   Future<void> _punchOut() async {
+    AppLogger.log(
+      event: "_punchOut() called",
+      uid: user?.uid,
+    );
     if (_submittedTime == null) {
       await _checkAttendance();
       if (_submittedTime == null) {
+        AppLogger.log(
+          event: "Punch In missing. Cannot Punch Out.",
+          uid: user?.uid,
+        );
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Punch In missing. Cannot Punch Out.")),
         );
@@ -483,6 +580,16 @@ class _AttendanceFormState extends State<AttendanceForm> {
     if ((!kIsWeb && _punchOutImage == null) ||
         (kIsWeb && _punchOutImageBytes == null) ||
         _position == null) {
+      AppLogger.log(
+        event: "PunchOut FAILED - missing selfie or location",
+        uid: user?.uid,
+        data: {
+          "hasImage": kIsWeb
+              ? _punchOutImageBytes != null
+              : _punchOutImage != null,
+          "hasLocation": _position != null,
+        },
+      );
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Please take selfie & location")),
       );
@@ -503,6 +610,10 @@ class _AttendanceFormState extends State<AttendanceForm> {
       );
 
       if (kIsWeb) {
+        AppLogger.log(
+          event: "Uploading PunchOut selfie (web)",
+          uid: user?.uid,
+        );
         /// ✅ Web: upload bytes directly
         await ref.putData(_punchOutImageBytes!);
         selfieUrl = await ref.getDownloadURL();
@@ -516,6 +627,11 @@ class _AttendanceFormState extends State<AttendanceForm> {
         await ref.putFile(file);
         selfieUrl = await ref.getDownloadURL();
       }
+      AppLogger.log(
+        event: "PunchOut selfie uploaded",
+        uid: user?.uid,
+        data: {"selfieUrl": selfieUrl},
+      );
 
       final todayDate = DateTime(today.year, today.month, today.day);
 
@@ -547,12 +663,25 @@ class _AttendanceFormState extends State<AttendanceForm> {
           _punchOutTime = punchOutTime;
           _totalHours = "${totalHours.inHours}h ${totalHours.inMinutes % 60}m";
         });
-
+        AppLogger.log(
+          event: "PunchOut SUCCESS",
+          uid: user?.uid,
+          data: {
+            "totalHoursFormatted": _totalHours,
+            "minutes": minutes,
+          },
+        );
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(const SnackBar(content: Text("Punch Out successful ✅")));
       }
     } catch (e) {
+      AppLogger.log(
+        event: "PunchOut ERROR",
+        uid: user?.uid,
+        data: {"error": e.toString()},
+      );
+
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text("Error: $e")));
@@ -565,7 +694,14 @@ class _AttendanceFormState extends State<AttendanceForm> {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null || _submittedTime == null || _punchOutTime == null)
-        return;
+        {
+          AppLogger.log(
+            event: "_requestExemption Exemption Request Failed - Missing user or times",
+            uid: user?.uid,
+          );
+          return;
+        }
+
 
       final todayDate = DateTime(
         _submittedTime!.year,
@@ -580,25 +716,41 @@ class _AttendanceFormState extends State<AttendanceForm> {
           .limit(1)
           .get();
 
-      if (attendanceSnap.docs.isEmpty) return;
-      final docId = attendanceSnap.docs.first.id;
+      if (attendanceSnap.docs.isEmpty) {
+        AppLogger.log(
+          event: "Exemption Request Failed - No attendance record found for today",
+          uid: user.uid,
+        );
+        return;
+      }
 
-      await FirebaseFirestore.instance
-          .collection("attendance")
-          .doc(docId)
-          .update({
+          final docId = attendanceSnap.docs.first.id;
+
+          await FirebaseFirestore.instance
+              .collection("attendance")
+              .doc(docId)
+              .update({
             "exemptionStatus": "requested",
             "exemptionRequestedAt": Timestamp.now(),
           });
-
-      setState(() {
-        _exemptionRequested = true;
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Exemption request sent to Admin ✅')),
+      AppLogger.log(
+        event: "Exemption Request Updated Successfully",
+        uid: user.uid,
       );
+
+          setState(() {
+            _exemptionRequested = true;
+          });
+
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Exemption request sent to Admin ✅')),
+          );
+
     } catch (e) {
+      AppLogger.log(
+        event: "Exemption Request Error: $e",
+        uid: user!.uid,
+      );
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('Error: $e')));
@@ -606,81 +758,95 @@ class _AttendanceFormState extends State<AttendanceForm> {
   }
 
   Future<void> _checkForAutoLogout() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return;
+    try {
+      if (user == null) {
+        AppLogger.log(
+          event: "_checkForAutoLogout(): No user logged in",
+          uid: "NO_USER",
+        );
+        return;
+      }
+      AppLogger.log(
+        event: "AutoLogout: Check started",
+        uid: user!.uid,
+      );
 
-    final now = DateTime.now();
-    final yesterday = now.subtract(const Duration(days: 1));
+      final now = DateTime.now();
+      final today = DateTime(now.year, now.month, now.day);
 
-    // ------------------------------
-    // 1️⃣ Get yesterday's attendance
-    // ------------------------------
-    final yesterdayStart = DateTime(yesterday.year, yesterday.month, yesterday.day);
-    final yesterdayEnd = yesterdayStart.add(const Duration(days: 1));
+      // 1️⃣ Find the most recent attendance without punch-out
+      final query = await FirebaseFirestore.instance
+          .collection('attendance')
+          .where('userId', isEqualTo: user!.uid)
+          .where('punchOutTime', isNull: true)
+          .orderBy('punchInDate', descending: true)
+          .limit(1)
+          .get();
 
-    final query = await FirebaseFirestore.instance
-        .collection('attendance')
-        .where('userId', isEqualTo: user.uid)
-        .where('punchInDate', isGreaterThanOrEqualTo: yesterdayStart)
-        .where('punchInDate', isLessThan: yesterdayEnd)
-        .limit(1)
-        .get();
+      if (query.docs.isEmpty) {
+        AppLogger.log(
+          event: "AutoLogout: No attendance found for autologout",
+          uid: user!.uid,
+        );
+        return;
+      }
 
-    if (query.docs.isEmpty) return;
+      final doc = query.docs.first;
+      final data = doc.data();
 
-    final doc = query.docs.first;
-    final data = doc.data();
+      final punchIn = (data['punchInTime'] as Timestamp?)?.toDate();
+      if (punchIn == null) {
+        AppLogger.log(
+          event: "AutoLogout: punchIn is null",
+          uid: user!.uid,
+        );
+        return;
+      }
 
-    final punchIn = (data['punchInTime'] as Timestamp?)?.toDate();
-    final punchOut = data['punchOutTime'];
+      final punchInDate = DateTime(punchIn.year, punchIn.month, punchIn.day);
 
-    if (punchIn == null || punchOut != null) return;
+      // 2️⃣ If punch-in is today → DO NOT auto logout
+      if (punchInDate == today) {
+        AppLogger.log(
+          event: "AutoLogout: punchInDate: $punchInDate today: $today both are same so don't log out",
+          uid: user!.uid,
+        );
+        return;
+      }
 
-    // --------------------------------------------
-    // 2️⃣ Ensure auto-punch-out is ONLY once
-    //    Trigger time: after midnight → before 7:30 AM
-    // --------------------------------------------
-    final midnightToday = DateTime(punchIn.year, punchIn.month, punchIn.day + 1, 0, 0);
-    final cutoffTime   = DateTime(punchIn.year, punchIn.month, punchIn.day + 1, 7, 30);
+      // 3️⃣ Auto punch-out time = 7:30 PM of punch-in day
+      final autoPunchOut = DateTime(
+        punchIn.year,
+        punchIn.month,
+        punchIn.day,
+        19,
+        30,
+      );
 
-    final bool isAfterMidnight = now.isAfter(midnightToday);
-    final bool isBeforeCutoff  = now.isBefore(cutoffTime);
-    // final bool isAfterMidnight = true;
-    // final bool isBeforeCutoff  = true;
+      final int totalMinutes = (autoPunchOut.difference(punchIn).inSeconds / 60).round();
+      await doc.reference.update({
+            'punchOutTime': Timestamp.fromDate(autoPunchOut),
+            'punchOutSelfieUrl': 'auto_punchout',
+            'punchOutLatitude': 0.0,
+            'punchOutLongitude': 0.0,
+            'punchOutAddress': 'Auto punch-out',
+            'totalHours': totalMinutes,
+            'autoLogout': true,
+          });
 
-    if (!isAfterMidnight || !isBeforeCutoff) return;
-
-    // --------------------------------------------
-    // 3️⃣ Auto punch-out at fixed time: 7:30 PM
-    // --------------------------------------------
-    final autoPunchOut = DateTime(
-      punchIn.year,
-      punchIn.month,
-      punchIn.day,
-      19,
-      30,
-    );
-
-    final int totalMinutes =
-    (autoPunchOut.difference(punchIn).inSeconds / 60).round();
-    debugPrint("Perform auto logout");
-    await doc.reference.update({
-      'punchOutTime': Timestamp.fromDate(autoPunchOut),
-      'punchOutSelfieUrl': 'auto_punchout',
-      'punchOutLatitude': 0.0,
-      'punchOutLongitude': 0.0,
-      'punchOutAddress': 'Auto punch-out by system',
-      'totalHours': totalMinutes,
-      'autoLogout': true,
-    });
-
-    if (mounted) {
-      setState(() {
-        _message = "⏰ Auto punch-out done at 7:30 PM (system generated)";
-      });
+          if (mounted) {
+            setState(() {
+              _message = "⏰ Auto punch-out done at 7:30 PM (system generated)";
+            });
+          }
+    }
+    catch (e) {
+      AppLogger.log(
+        event: "AutoLogout ERROR: $e",
+        uid: user?.uid,
+      );
     }
   }
-
 
   Widget buildSelfiePreview(bool isPunchOut) {
     final bytes = isPunchOut ? _punchOutImageBytes : _punchInImageBytes;
@@ -701,6 +867,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
   @override
   void initState() {
     super.initState();
+    AppLogger.log(event: "Attendance Form Opened", uid: user!.uid);
     _checkForAutoLogout();
     _checkAttendance();
     _checkExemptionStatus();
@@ -823,6 +990,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
                   leading: const Icon(Icons.logout, color: Colors.red),
                   title: const Text("Logout"),
                   onTap: () {
+                    AppLogger.log(event: "user logged out! ", uid: user!.uid);
                     FirebaseAuth.instance.signOut();
                     Navigator.pop(context);
                     Navigator.push(
@@ -972,19 +1140,12 @@ class _AttendanceFormState extends State<AttendanceForm> {
                                 const SizedBox(height: 12),
 
                                 // Punch Out Row
-                                Row(
-                                  children: [
-                                    const Icon(Icons.logout, color: Colors.red),
-                                    const SizedBox(width: 8),
-                                    Text(
-                                      _punchOutTime != null
-                                          ? "Punch Out: ${DateFormat(
-                                          'dd MMM, hh:mm a').format(
-                                          _punchOutTime!)}"
-                                          : "Punch Out: Not yet",
-                                    ),
-                                  ],
-                                ),
+                                Row( children:
+                                [
+                                  const Icon(Icons.logout, color: Colors.red),
+                                  const SizedBox(width: 8),
+                                  Text( _punchOutTime != null ? "Punch Out: ${DateFormat( 'dd MMM, hh:mm a').format( _punchOutTime!)}" : "Punch Out: Not yet",
+                                  ), ], ),
 
                                 // ✅ Calculate total working hours
                                 Builder(
@@ -1173,7 +1334,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
                                     child: ElevatedButton(
                                       onPressed: (_loading || _isPreviewLoading)
                                           ? null
-                                          : _submitAttendance,
+                                          : _punchIn,
                                       child: _loading
                                           ? const CircularProgressIndicator(
                                         color: Colors.white,

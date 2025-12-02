@@ -3,6 +3,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart'; // for kIsWeb
 import 'package:flutter/material.dart';
 import 'attendance_form.dart'; // your home page
+import 'logger.dart';
 
 class EmailVerificationPage extends StatefulWidget {
   final User user;
@@ -31,6 +32,11 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
             .doc(user.uid)
             .update({"isEmailVerified": true});
 
+        AppLogger.log(
+          event: "Navigate → AttendanceForm",
+          uid: user.uid,
+        );
+
         // Navigate to home safely
         if (!mounted) return;
         Navigator.pushReplacement(
@@ -38,11 +44,20 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
           MaterialPageRoute(builder: (_) => const AttendanceForm()),
         );
       } else {
+        AppLogger.log(
+          event: "Email Not Yet Verified",
+          uid: user.uid,
+        );
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Email not verified yet.")),
         );
       }
     } catch (e) {
+      AppLogger.log(
+        event: "Check Verification FAILED",
+        uid: widget.user.uid,
+        data: {"error": e.toString()},
+      );
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("Error checking verification: $e")),
       );
@@ -56,13 +71,27 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
     setState(() => _loading = true);
 
     try {
+      AppLogger.log(
+        event: "Resend Verification Email Clicked",
+        uid: widget.user.uid,
+      );
       final user = FirebaseAuth.instance.currentUser!;   // <-- IMPORTANT
       await user.sendEmailVerification();
+
+      AppLogger.log(
+        event: "Resend Verification Email SUCCESS",
+        uid: user.uid,
+      );
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Verification email sent.")),
       );
 
     } catch (e) {
+      AppLogger.log(
+        event: "Resend Verification Email FAILED",
+        uid: widget.user.uid,
+        data: {"error": e.toString()},
+      );
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("Error sending verification email: $e")),
       );
@@ -135,7 +164,13 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
                     width: double.infinity,
                     height: 48,
                     child: ElevatedButton(
-                      onPressed: _loading ? null : checkVerification,
+                      onPressed: _loading ? null : () async {
+                        AppLogger.log(
+                          event: "Pressed: I have verified",
+                          uid: widget.user.uid,
+                        );
+                        await checkVerification();
+                      },
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.orangeAccent,
                         shape: RoundedRectangleBorder(
