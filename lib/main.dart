@@ -260,6 +260,10 @@ Future<void> scheduleDailyAttendanceReminder() async {
       if (scheduleTime.isBefore(now)) {
         scheduleTime = scheduleTime.add(const Duration(days: 1));
       }
+    AppLogger.log(
+      event: "Reminder PASSED all checks — Now Scheduling",
+      uid: uid,
+    );
 
       // ❗ DO NOT cancel all notifications → allows tomorrow's reminder
       await flutterLocalNotificationsPlugin.zonedSchedule(
