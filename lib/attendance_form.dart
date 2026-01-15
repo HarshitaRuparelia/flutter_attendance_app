@@ -4,6 +4,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
@@ -16,6 +17,10 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'camera_screen_wrapper.dart';
 import 'logger.dart';
+
+// Notifications plugin (Mobile only)
+import 'notification_service.dart';
+import 'package:timezone/timezone.dart' as tz;
 
 class AttendanceForm extends StatefulWidget {
   const AttendanceForm({super.key});
@@ -44,6 +49,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
   Uint8List? _punchInImageBytes;
   Uint8List? _punchOutImageBytes;
   bool _isPreviewLoading = false;
+  DateTime? _punchInCaptureTime;
+  DateTime? _punchOutCaptureTime;
+  final TextEditingController _exemptionReasonController = TextEditingController();
 
   // ---------------- Helper Methods ----------------
 
@@ -135,6 +143,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
     print("_captureSelfie new");
 
     AppLogger.log(event: "_captureSelfie() called ", uid: user!.uid);
+    final captureTime = DateTime.now();
 
     final capturedBytes = await Navigator.push(
       context,
@@ -179,6 +188,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
           _punchOutImage = file;
           _punchOutImageBytes = bytes;
           _punchOutAddress = address;
+          _punchOutCaptureTime = captureTime;
           AppLogger.log(
             event: "Punch OUT image set | Address: $_punchOutAddress",
             uid: user!.uid,
@@ -187,6 +197,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
           _punchInImage = file;
           _punchInImageBytes = bytes;
           _punchInAddress = address;
+          _punchInCaptureTime = captureTime;
           AppLogger.log(
             event: "Punch IN image set | Address: $_punchOutAddress",
             uid: user!.uid,
@@ -434,11 +445,48 @@ class _AttendanceFormState extends State<AttendanceForm> {
     }
   }
 
+  Future<bool> validateDeviceTime() async {
+    final ref = FirebaseFirestore.instance
+        .collection("_server")
+        .doc("time");
+
+    await ref.set({
+      "now": FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+
+    final snap = await ref.get();
+    final serverTime = (snap["now"] as Timestamp).toDate();
+    final deviceTime = DateTime.now();
+
+    return serverTime.difference(deviceTime).inMinutes.abs() <= 2;
+  }
+
   Future<void> _punchIn() async {
     AppLogger.log(
       event: "_punchIn() called",
       uid: user?.uid,
     );
+
+    if (!await validateDeviceTime()) {
+      AppLogger.log(
+        event: "Incorrect date & time detected. Please enable Automatic Date & Time.",
+        uid: user?.uid,
+        data: {
+          "currentTime": FieldValue.serverTimestamp(),
+          "detectedDeviceTime": DateTime.now(),
+        },
+      );
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Incorrect date & time detected.\nPlease enable Automatic Date & Time.",
+          ),
+        ),
+      );
+      return;
+    }
+
     if ((!kIsWeb && _punchInImage == null) ||
         (kIsWeb && _punchInImageBytes == null) ||
         _position == null) {
@@ -459,20 +507,52 @@ class _AttendanceFormState extends State<AttendanceForm> {
       return;
     }
 
-    DateTime now = DateTime.now();
-    DateTime allowedTime = DateTime(now.year, now.month, now.day, 9, 0);
-    if (now.isBefore(allowedTime)) {
+    if (_punchInCaptureTime == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Please capture selfie first")),
+      );
+      return;
+    }
+    final captureTime = _punchInCaptureTime!;
+
+    /// 🔒 Rule 1: Punch-in allowed only after 9:00 AM (based on selfie time)
+
+    DateTime allowedTime = DateTime(captureTime.year, captureTime.month, captureTime.day, 9, 0);
+    if (captureTime.isBefore(allowedTime)) {
       AppLogger.log(
         event: "Punch In allowed only after 9:00 AM",
         uid: user?.uid,
         data: {
-          "currentTime": now.toString(),
+          "currentTime": captureTime.toString(),
           "allowedTime": allowedTime.toString(),
         },
       );
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Punch In allowed only after 9:00 AM")),
+      );
+      return;
+    }
+
+    /// 🔒 Rule 2: Button click must be within 2 minutes
+    final diff =
+        DateTime.now().difference(captureTime).inMinutes;
+
+    if (diff > 2) {
+      AppLogger.log(
+          event: "Punch In must be done within 2 minutes of selfie capture. Please re-capture selfie",
+          uid: user?.uid,
+        data: {
+          "currentTime": FieldValue.serverTimestamp(),
+          "captureTime": captureTime.toString(),
+        },
+      );
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Punch In must be done within 2 minutes of selfie capture.\nPlease re-capture selfie",
+          ),
+        ),
       );
       return;
     }
@@ -484,7 +564,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
       final userName = await _getUserName(); // Fetch name from Firestore
       final formattedDate =
-          "${now.year}-${now.month}-${now.day}_${now.hour}-${now.minute}";
+          "${captureTime.year}-${captureTime.month}-${captureTime.day}_${captureTime.hour}-${captureTime.minute}";
 
       final ref = FirebaseStorage.instance.ref().child(
         "selfies/${userName}_PunchIn_$formattedDate.jpg",
@@ -514,23 +594,25 @@ class _AttendanceFormState extends State<AttendanceForm> {
         uid: user?.uid,
         data: {"selfieUrl": selfieUrl},
       );
-      DateTime cutoff = DateTime(now.year, now.month, now.day, 10, 15);
-      bool isLate = now.isAfter(cutoff);
+      /// 🔒 Late logic based on selfie time
+      DateTime cutoff = DateTime(captureTime.year, captureTime.month, captureTime.day, 10, 15);
+      bool isLate = captureTime.isAfter(cutoff);
 
       await FirebaseFirestore.instance.collection("attendance").add({
         "userId": user?.uid,
         "punchInLatitude": _position!.latitude,
         "punchInLongitude": _position!.longitude,
         "punchInAddress": _punchInAddress,
-        "punchInTime": now,
-        "punchInDate": DateTime(now.year, now.month, now.day),
+        "punchInTime": captureTime,
+        "punchInSubmittedAt": FieldValue.serverTimestamp(), // audit
+        "punchInDate": DateTime(captureTime.year, captureTime.month, captureTime.day),
         "punchInSelfieUrl": selfieUrl,
         "isLate": isLate,
         'punchOutTime': null,
       });
 
       setState(() {
-        _submittedTime = now;
+        _submittedTime = captureTime;
         _alreadySubmitted = true;
         _isLate = isLate;
       });
@@ -563,6 +645,25 @@ class _AttendanceFormState extends State<AttendanceForm> {
       event: "_punchOut() called",
       uid: user?.uid,
     );
+    if (!await validateDeviceTime()) {
+      AppLogger.log(
+        event: "Incorrect date & time detected. Please enable Automatic Date & Time.",
+        uid: user?.uid,
+        data: {
+          "currentTime": FieldValue.serverTimestamp(),
+          "detectedDeviceTime": DateTime.now(),
+        },
+      );
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Incorrect date & time detected.\nPlease enable Automatic Date & Time.",
+          ),
+        ),
+      );
+      return;
+    }
     if (_submittedTime == null) {
       await _checkAttendance();
       if (_submittedTime == null) {
@@ -596,14 +697,39 @@ class _AttendanceFormState extends State<AttendanceForm> {
       return;
     }
 
+    final captureTime = _punchOutCaptureTime!;
+
+    final diff =
+        DateTime.now().difference(captureTime).inMinutes;
+
+    if (diff > 2) {
+      AppLogger.log(
+        event: "Punch Out must be done within 2 minutes of selfie capture. Please re-capture selfie",
+        uid: user?.uid,
+        data: {
+          "currentTime": FieldValue.serverTimestamp(),
+          "captureTime": captureTime.toString(),
+        },
+      );
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Punch Out must be done within 2 minutes of selfie capture.\nPlease re-capture selfie",
+          ),
+        ),
+      );
+      return;
+    }
+
     setState(() => _loading = true);
 
     try {
       String selfieUrl = "";
-      final today = DateTime.now();
+
       final userName = await _getUserName(); // Fetch name from Firestore
       final formattedDate =
-          "${today.year}-${today.month}-${today.day}_${today.hour}-${today.minute}";
+          "${captureTime.year}-${captureTime.month}-${captureTime.day}_${captureTime.hour}-${captureTime.minute}";
 
       final ref = FirebaseStorage.instance.ref().child(
         "selfies/${userName}_PunchOut_$formattedDate.jpg",
@@ -633,7 +759,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
         data: {"selfieUrl": selfieUrl},
       );
 
-      final todayDate = DateTime(today.year, today.month, today.day);
+      final todayDate = DateTime(captureTime.year, captureTime.month, captureTime.day);
 
       final snap = await FirebaseFirestore.instance
           .collection("attendance")
@@ -642,8 +768,8 @@ class _AttendanceFormState extends State<AttendanceForm> {
           .get();
 
       if (snap.docs.isNotEmpty) {
-        DateTime punchOutTime = DateTime.now();
-        final totalHours = punchOutTime.difference(_submittedTime!);
+       // DateTime punchOutTime = captureTime;
+        final totalHours = captureTime.difference(_submittedTime!);
 
         final int minutes = (totalHours.inSeconds / 60).round();
 
@@ -651,7 +777,8 @@ class _AttendanceFormState extends State<AttendanceForm> {
             .collection("attendance")
             .doc(snap.docs.first.id)
             .update({
-              "punchOutTime": punchOutTime,
+              "punchOutTime": captureTime,  // selfie captured time
+              "punchOutSubmittedAt": FieldValue.serverTimestamp(), // punch out button click time, real time
               "punchOutSelfieUrl": selfieUrl,
               "punchOutLatitude": _position!.latitude,
               "punchOutLongitude": _position!.longitude,
@@ -660,7 +787,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
             });
 
         setState(() {
-          _punchOutTime = punchOutTime;
+          _punchOutTime = captureTime;
           _totalHours = "${totalHours.inHours}h ${totalHours.inMinutes % 60}m";
         });
         AppLogger.log(
@@ -690,7 +817,54 @@ class _AttendanceFormState extends State<AttendanceForm> {
     setState(() => _loading = false);
   }
 
-  Future<void> _requestExemption() async {
+  void _showExemptionDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text("Seek Exemption"),
+          content: TextField(
+            controller: _exemptionReasonController,
+            maxLines: 3,
+            decoration: const InputDecoration(
+              hintText: "Enter reason for exemption",
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                _exemptionReasonController.clear();
+                Navigator.pop(context);
+              },
+              child: const Text("Cancel"),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final reason = _exemptionReasonController.text.trim();
+                if (reason.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text("Please enter exemption reason"),
+                    ),
+                  );
+                  return;
+                }
+
+                Navigator.pop(context);
+                _requestExemption(reason);
+              },
+              child: const Text("Submit"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+
+  Future<void> _requestExemption(String reason) async {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null || _submittedTime == null || _punchOutTime == null)
@@ -732,7 +906,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
               .update({
             "exemptionStatus": "requested",
             "exemptionRequestedAt": Timestamp.now(),
+            "exemptionReason": reason,
           });
+      _exemptionReasonController.clear();
       AppLogger.log(
         event: "Exemption Request Updated Successfully",
         uid: user.uid,
@@ -864,14 +1040,150 @@ class _AttendanceFormState extends State<AttendanceForm> {
     );
   }
 
+  Future<void> scheduleDailyAttendanceReminder() async {
+    if (kIsWeb) return;
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) {
+      AppLogger.log(event: "Reminder: No user logged in → Skipping", uid: "NO_USER");
+      return;
+    }
+    AppLogger.log(event: "scheduleDailyAttendanceReminder(): Started", uid: uid);
+    final today = DateTime.now();
+    final dateStr =
+        "${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}";
+
+    final firestore = FirebaseFirestore.instance;
+
+    // 1️⃣ Skip Sunday
+    if (today.weekday == DateTime.sunday) {
+      AppLogger.log(event: "Reminder: Sunday → Skipped", uid: uid);
+      return;
+    }
+
+    // 2️⃣ Skip 2nd & 4th Saturday
+    if (today.weekday == DateTime.saturday) {
+      int count = 0;
+      for (int i = 1; i <= today.day; i++) {
+        if (DateTime(today.year, today.month, i).weekday == DateTime.saturday) {
+          count++;
+        }
+      }
+      if (count == 2 || count == 4) {
+        AppLogger.log(
+          event: "Reminder: ${count == 2 ? "2nd" : "4th"} Saturday → Skipped",
+          uid: uid,
+        );
+        return;
+      }
+    }
+
+    // 3️⃣ Holiday check
+    final holidayDoc = await firestore.collection('holidays').doc(dateStr).get();
+    if (holidayDoc.exists) {
+      AppLogger.log(
+        event: "Reminder: Today is a Holiday → Skipped",
+        uid: uid,
+      );
+      return;
+    }
+
+    // 4️⃣ Leave check
+    final leaves = await firestore
+        .collection('leaves')
+        .where('userId', isEqualTo: uid)
+        .where('status', isEqualTo: 'Approved')
+        .get();
+
+    bool onLeaveToday = false;
+    for (var doc in leaves.docs) {
+      final start = (doc["startDate"] as Timestamp).toDate();
+      final end = (doc["endDate"] as Timestamp).toDate();
+
+      if (!today.isBefore(start) && !today.isAfter(end)) {
+        onLeaveToday = true;
+        AppLogger.log(
+          event: "Reminder: User on leave today → Skipped",
+          uid: uid,
+        );
+        break;
+      }
+    }
+
+    if (onLeaveToday) return;
+
+    // Notification config
+    const androidDetails = AndroidNotificationDetails(
+      'attendance_reminder_channel',
+      'Attendance Reminder',
+      importance: Importance.max,
+      priority: Priority.high,
+      actions: [
+        AndroidNotificationAction(
+          'DISMISS_ACTION',
+          'I’m Done ✅',
+          showsUserInterface: true,
+          cancelNotification: true,
+        ),
+      ],
+    );
+
+    const details = NotificationDetails(android: androidDetails);
+
+    final now = tz.TZDateTime.now(tz.local);
+    var scheduleTime = tz.TZDateTime(tz.local, now.year, now.month, now.day, 10);
+    // for testing
+    //var scheduleTime = now.add(const Duration(minutes: 1));
+    // If it's already past 10 AM: remind next day
+    if (scheduleTime.isBefore(now)) {
+      scheduleTime = scheduleTime.add(const Duration(days: 1));
+    }
+    AppLogger.log(
+      event: "Reminder PASSED all checks — Now Scheduling",
+      uid: uid,
+    );
+
+    // ❗ DO NOT cancel all notifications → allows tomorrow's reminder
+    await flutterLocalNotificationsPlugin.zonedSchedule(
+      101, // use a consistent ID
+      'Attendance Reminder',
+      'Please mark your attendance 📸',
+      scheduleTime,
+      details,
+      uiLocalNotificationDateInterpretation:
+      UILocalNotificationDateInterpretation.absoluteTime,
+      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      matchDateTimeComponents: DateTimeComponents.time, // 🔥 repeats daily
+    );
+    AppLogger.log(
+      event:
+      "Reminder Scheduled for: ${scheduleTime.toString()}",
+      uid: uid,
+    );
+  }
   @override
   void initState() {
     super.initState();
     AppLogger.log(event: "Attendance Form Opened", uid: user!.uid);
+
+    if (!kIsWeb) {
+      Future.microtask(() async {
+        AppLogger.log(
+          event: "AttendanceForm opened — Scheduling reminder",
+          uid: FirebaseAuth.instance.currentUser?.uid ?? "NO_UID",
+        );
+        await scheduleDailyAttendanceReminder();
+      });
+    }
     _checkForAutoLogout();
     _checkAttendance();
     _checkExemptionStatus();
     _checkNoPunchInDay();
+  }
+
+  @override
+  void dispose() {
+    _exemptionReasonController.dispose();
+    super.dispose();
   }
 
   Widget _exemptionButton(String exemptionStatus) {
@@ -890,7 +1202,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
     }
 
     return ElevatedButton.icon(
-      onPressed: disabled ? null : _requestExemption,
+      onPressed: disabled ? null : _showExemptionDialog,
       icon: const Icon(Icons.report_problem),
       label: Text(label),
       style: ElevatedButton.styleFrom(
