@@ -60,18 +60,20 @@ class _AuthPageState extends State<AuthPage> {
         "email": email,
         "name": name,
         "createdAt": FieldValue.serverTimestamp(),
+        "isTestUser": false,
       });
       AppLogger.log(event: "Signup Success and mail sent ", uid: user.uid, data: {
         "email": email,
         "name": name,
       });
       await user.sendEmailVerification();   // ← REQUIRED
+     // await FirebaseAuth.instance.signOut();
 
       // 3️⃣ Navigate to Email Verification Page
       if (!mounted) return;
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (_) => EmailVerificationPage(user: FirebaseAuth.instance.currentUser!)),
+        MaterialPageRoute(builder: (_) => EmailVerificationPage()),
       );
 
     } catch (e) {
@@ -132,7 +134,9 @@ class _AuthPageState extends State<AuthPage> {
           password: password,
         );
 
-        final user = userCredential.user!;
+        User user = userCredential.user!;
+        await user.reload();
+        user = FirebaseAuth.instance.currentUser!;
 
         if (!user.emailVerified) {
           if (!mounted) return;
@@ -140,7 +144,7 @@ class _AuthPageState extends State<AuthPage> {
             context,
             MaterialPageRoute(
               builder: (_) =>
-                  EmailVerificationPage(user: FirebaseAuth.instance.currentUser!),
+                  EmailVerificationPage(),
             ),
           );
           return;

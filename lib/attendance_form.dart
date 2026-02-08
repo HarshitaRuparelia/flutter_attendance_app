@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -9,6 +10,7 @@ import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter/foundation.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'attendance_history_screen.dart';
 import 'auth_page.dart';
 import 'leave_screen.dart';
@@ -32,11 +34,11 @@ class AttendanceForm extends StatefulWidget {
 class _AttendanceFormState extends State<AttendanceForm> {
   File? _punchInImage;
   File? _punchOutImage;
-  String _punchInAddress = "";
-  String _punchOutAddress = "";
+  String? _punchInAddress;
+  String? _punchOutAddress;
   Position? _position;
   bool _loading = false;
-  String address = "";
+  String? address;
   final User? user = FirebaseAuth.instance.currentUser;
   bool _alreadySubmitted = false;
   DateTime? _submittedTime; // Punch In
@@ -52,6 +54,8 @@ class _AttendanceFormState extends State<AttendanceForm> {
   DateTime? _punchInCaptureTime;
   DateTime? _punchOutCaptureTime;
   final TextEditingController _exemptionReasonController = TextEditingController();
+  bool _isLocationValid = false;
+  String _appVersion = "";
 
   // ---------------- Helper Methods ----------------
 
@@ -81,7 +85,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
       reason = "No Punch-In needed today — It's Sunday (Weekly Holiday).";
     }
     // 2️⃣ 2nd or 4th Saturday
-    else if (now.weekday == DateTime.saturday) {
+   /* else if (now.weekday == DateTime.saturday) {
       int saturdayCount = 0;
       for (int d = 1; d <= now.day; d++) {
         DateTime checkDay = DateTime(now.year, now.month, d);
@@ -92,7 +96,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
         reason =
             "No Punch-In needed today — It's ${saturdayCount == 2 ? "2nd" : "4th"} Saturday (Holiday).";
       }
-    }
+    }*/
 
     // 3️⃣ Admin-declared holidays (from Firestore)
     if (reason == null) {
@@ -140,9 +144,30 @@ class _AttendanceFormState extends State<AttendanceForm> {
   }
 
   Future<void> _captureSelfie({required bool isPunchOut}) async {
-    print("_captureSelfie new");
 
     AppLogger.log(event: "_captureSelfie() called ", uid: user!.uid);
+    setState(() {
+      _position = null;
+      address = null;
+      _punchInAddress = null;
+      _punchOutAddress = null;
+      _isLocationValid = false;
+      _punchInImage = null;
+      _punchInImageBytes = null;
+      _punchOutImage = null;
+      _punchOutImageBytes = null;
+    });
+
+    // 🔒 HARD STOP if no internet
+    if (!await hasInternet()) {
+      AppLogger.log(event: "_captureSelfie 1. Internet is required to capture selfie", uid: user!.uid);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Internet is required to capture selfie"),
+        ),
+      );
+      return;
+    }
     final captureTime = DateTime.now();
 
     final capturedBytes = await Navigator.push(
@@ -162,7 +187,18 @@ class _AttendanceFormState extends State<AttendanceForm> {
       event: "Fetching device location",
       uid: user!.uid,
     );
-    await _getLocation();
+    // 🔒 CHECK AGAIN (user may turn off internet mid-flow)
+    if (!await hasInternet()) {
+      AppLogger.log(event: "_captureSelfie 2. Internet is required to capture selfie", uid: user!.uid);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Internet is required to capture selfie"),
+        ),
+      );
+      return;
+    }
+    final locationOk = await _getLocation();
+    if (!locationOk) return;
 
     Uint8List bytes;
     File? file;
@@ -187,7 +223,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
         if (isPunchOut) {
           _punchOutImage = file;
           _punchOutImageBytes = bytes;
-          _punchOutAddress = address;
+          _punchOutAddress = address?.trim().isNotEmpty == true ? address : null;
           _punchOutCaptureTime = captureTime;
           AppLogger.log(
             event: "Punch OUT image set | Address: $_punchOutAddress",
@@ -196,10 +232,10 @@ class _AttendanceFormState extends State<AttendanceForm> {
         } else {
           _punchInImage = file;
           _punchInImageBytes = bytes;
-          _punchInAddress = address;
+          _punchInAddress = address?.trim().isNotEmpty == true ? address : null;
           _punchInCaptureTime = captureTime;
           AppLogger.log(
-            event: "Punch IN image set | Address: $_punchOutAddress",
+            event: "Punch IN image set | Address: $_punchInAddress",
             uid: user!.uid,
           );
         }
@@ -209,82 +245,123 @@ class _AttendanceFormState extends State<AttendanceForm> {
     });
   }
 
-  Future<void> _getLocation() async {
+  Future<bool> _getLocation() async {
     try {
-      // Check if service is enabled
-      AppLogger.log(event: "_getLocation called", uid: user!.uid);
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
-        AppLogger.log(event: "Location Service Disabled", uid: user!.uid);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Please enable location services.")),
-        );
-        return;
+      AppLogger.log(event: "_getLocation() started", uid: user!.uid);
+
+      // 1️⃣ Service check
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        throw Exception("Location services are disabled");
       }
 
-      // Request permission
+      // 2️⃣ Permission check
       LocationPermission permission = await Geolocator.checkPermission();
-
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
       }
 
       if (permission == LocationPermission.denied ||
           permission == LocationPermission.deniedForever) {
-        AppLogger.log(event: "Location Permission Permanently Denied", uid: user!.uid);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("Location permission denied. Please enable it."),
-          ),
-        );
-        return;
+        throw Exception("Location permission denied");
       }
 
-      Position pos;
-      Position? cached;
-      if (kIsWeb) {
-         pos =  await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.bestForNavigation,
-        );
-      }
-      else {
-        // FIRST: Get last known location (faster + often accurate)
-        cached = await Geolocator.getLastKnownPosition();
+      // 3️⃣ Get fresh GPS ONLY (no cached)
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.bestForNavigation,
+        timeLimit: const Duration(seconds: 15),
+      );
 
-        // THEN: Get fresh GPS location
-        pos = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.bestForNavigation,
-          timeLimit: const Duration(seconds: 12),
+      // 4️⃣ Accuracy validation
+      final maxAccuracy = kIsWeb ? 100.0 : 50.0;
+      if (position.accuracy > maxAccuracy) {
+        throw Exception(
+          "Low GPS accuracy (${position.accuracy.toStringAsFixed(1)}m). "
+              "Please move to open area and retry.",
         );
       }
 
-      // Select the best accuracy
-      final best = (cached != null && cached.accuracy < pos.accuracy)
-          ? cached
-          : pos;
+      // 5️⃣ Mock GPS detection (Android)
+      if (!kIsWeb && position.isMocked) {
+        AppLogger.log(
+          event: "Mock GPS detected",
+          uid: user!.uid,
+          data: {
+            "lat": position.latitude,
+            "lng": position.longitude,
+          },
+        );
+        throw Exception("Fake / Mock GPS detected. Disable it to continue.");
+      }
 
-      if (!mounted) return;
+      // 7️⃣ Address lookup
+      final fetchedAddress  = await getAddressFromLatLng(position);
 
-      setState(() => _position = best);
+      setState(() {
+        _position = position;
+        _isLocationValid = true;
 
-      // Reverse geocode
-      address = await getAddressFromLatLng(best);
+        // 🔥 IMPORTANT: store address ONLY if available
+        if (fetchedAddress == null || fetchedAddress!.trim().isEmpty) {
+          _punchInAddress = null;
+          _punchOutAddress = null;
+        } else {
+          address = fetchedAddress; // optional, if you still need it
+        }
+      });
 
+      AppLogger.log(
+        event: "Location OK",
+        uid: user!.uid,
+        data: {
+          "lat": position.latitude,
+          "lng": position.longitude,
+          "accuracy": position.accuracy,
+          "mocked": !kIsWeb ? position.isMocked : false,
+        },
+      );
+      return true;
     } catch (e) {
       AppLogger.log(
-        event: "_getLocation() Exception***",
+        event: "_getLocation FAILED",
         uid: user!.uid,
         data: {"error": e.toString()},
       );
+      setState(() {
+        _position = null;
+         address = null;
+        _punchInAddress = null;
+        _punchOutAddress = null;
+        _punchInImage = null;
+        _punchInImageBytes = null;
+        _punchOutImage = null;
+        _punchOutImageBytes = null;
+        _isLocationValid = false;
+      });
+
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Failed to get location: $e")),
+        SnackBar(content: Text(e.toString())),
       );
+      return false;
     }
   }
 
+  Future<bool> hasInternet() async {
+    if (kIsWeb) {
+      // If web app is loaded, internet already exists
+      return true;
+    }
 
+    try {
+      final response = await http
+          .get(Uri.parse('https://clients3.google.com/generate_204'))
+          .timeout(const Duration(seconds: 3));
+      return response.statusCode == 204;
+    } catch (_) {
+      return false;
+    }
+  }
 
-  Future<String> getAddressFromLatLng(Position position) async {
+  Future<String?> getAddressFromLatLng(Position position) async {
     try {
       // -------------------------
       // ⭐ WEB → Use Google API
@@ -300,14 +377,21 @@ class _AttendanceFormState extends State<AttendanceForm> {
           "https://maps.googleapis.com/maps/api/geocode/json?latlng=$lat,$lng&key=$apiKey",
         );
 
-        final response = await http.get(url);
+        final response = await http.get(url).timeout(
+          const Duration(seconds: 5),
+        );
+
         final data = jsonDecode(response.body);
 
-        if (data["status"] == "OK") {
+        if (data["status"] == "OK" && data["results"] != null && data["results"].isNotEmpty) {
           return data["results"][0]["formatted_address"];
         } else {
+          AppLogger.log(
+            event: "Address not found (Web) Geocode Response =>  ${response.body}",
+            uid: user!.uid);
           print("Geocode Response: ${response.body}");
-          return "Address not found (Web)";
+          return null;
+          //return "Address not found (Web)";
         }
       // } else {
         // -------------------------
@@ -333,13 +417,33 @@ class _AttendanceFormState extends State<AttendanceForm> {
         ].where((x) => x != null && x!.trim().isNotEmpty).toSet() // removes duplicates automatically
         .join(", ");
       // }
-    } catch (e) {
+    }
+    on SocketException {
+      // 🔥 Internet OFF or very slow
+      AppLogger.log(
+        event: "Location not captured as (Internet is off)",
+        uid: user!.uid,
+      );
+      //return "Location not captured as (Internet is off)";
+      return null;
+    }
+    on TimeoutException {
+      // 🔥 Slow internet
+      AppLogger.log(
+        event: "Location not captured as (Network is slow)",
+        uid: user!.uid,
+      );
+     // return "Location not captured as (Network is slow)";
+      return null;
+    }
+    catch (e) {
       AppLogger.log(
         event: "getAddressFromLatLng Exception",
         uid: user!.uid,
         data: {"error": e.toString()},
       );
-      return "Error: $e";
+      //return "Error: $e";
+      return null;
     }
   }
 
@@ -458,7 +562,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
     final serverTime = (snap["now"] as Timestamp).toDate();
     final deviceTime = DateTime.now();
 
-    return serverTime.difference(deviceTime).inMinutes.abs() <= 2;
+    return serverTime.difference(deviceTime).inSeconds.abs() <= 120; //2mins
   }
 
   Future<void> _punchIn() async {
@@ -466,6 +570,15 @@ class _AttendanceFormState extends State<AttendanceForm> {
       event: "_punchIn() called",
       uid: user?.uid,
     );
+    if (!await hasInternet()) {
+      AppLogger.log(event: "Internet is required to punch in", uid: user?.uid);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Internet is required to punch in"),
+        ),
+      );
+      return;
+    }
 
     if (!await validateDeviceTime()) {
       AppLogger.log(
@@ -487,7 +600,8 @@ class _AttendanceFormState extends State<AttendanceForm> {
       return;
     }
 
-    if ((!kIsWeb && _punchInImage == null) ||
+    if (!_isLocationValid ||
+        (!kIsWeb && _punchInImage == null) ||
         (kIsWeb && _punchInImageBytes == null) ||
         _position == null) {
       AppLogger.log(
@@ -503,6 +617,22 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Please take selfie & location")),
+      );
+      return;
+    }
+
+    if (_punchInAddress == null || _punchInAddress!.trim().isEmpty) {
+      AppLogger.log(
+        event: "Location not captured. Please retry with stable internet.",
+        uid: user?.uid,
+      );
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Location not captured.\nPlease retry with stable internet.",
+          ),
+        ),
       );
       return;
     }
@@ -536,9 +666,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
     /// 🔒 Rule 2: Button click must be within 2 minutes
     final diff =
-        DateTime.now().difference(captureTime).inMinutes;
-
-    if (diff > 2) {
+        DateTime.now().difference(captureTime).inSeconds;
+    AppLogger.log(event: "punchin Diff in secs-> $diff", uid: user?.uid);
+    if (diff > 120) {
       AppLogger.log(
           event: "Punch In must be done within 2 minutes of selfie capture. Please re-capture selfie",
           uid: user?.uid,
@@ -645,6 +775,17 @@ class _AttendanceFormState extends State<AttendanceForm> {
       event: "_punchOut() called",
       uid: user?.uid,
     );
+    if (!await hasInternet()) {
+      AppLogger.log(
+          event: "Internet is required to punch out",
+          uid: user?.uid);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Internet is required to punch out"),
+        ),
+      );
+      return;
+    }
     if (!await validateDeviceTime()) {
       AppLogger.log(
         event: "Incorrect date & time detected. Please enable Automatic Date & Time.",
@@ -697,12 +838,28 @@ class _AttendanceFormState extends State<AttendanceForm> {
       return;
     }
 
+    if (_punchOutAddress == null || _punchOutAddress!.trim().isEmpty) {
+      AppLogger.log(
+        event: "Location not captured. Please retry with stable internet.",
+        uid: user?.uid,
+      );
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Location not captured.\nPlease retry with stable internet.",
+          ),
+        ),
+      );
+      return;
+    }
+
     final captureTime = _punchOutCaptureTime!;
 
     final diff =
-        DateTime.now().difference(captureTime).inMinutes;
-
-    if (diff > 2) {
+        DateTime.now().difference(captureTime).inSeconds;
+    AppLogger.log(event: "punchout Diff in secs-> $diff", uid: user?.uid);
+    if (diff > 120) {
       AppLogger.log(
         event: "Punch Out must be done within 2 minutes of selfie capture. Please re-capture selfie",
         uid: user?.uid,
@@ -1061,7 +1218,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
     }
 
     // 2️⃣ Skip 2nd & 4th Saturday
-    if (today.weekday == DateTime.saturday) {
+   /* if (today.weekday == DateTime.saturday) {
       int count = 0;
       for (int i = 1; i <= today.day; i++) {
         if (DateTime(today.year, today.month, i).weekday == DateTime.saturday) {
@@ -1075,7 +1232,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
         );
         return;
       }
-    }
+    }*/
 
     // 3️⃣ Holiday check
     final holidayDoc = await firestore.collection('holidays').doc(dateStr).get();
@@ -1160,10 +1317,12 @@ class _AttendanceFormState extends State<AttendanceForm> {
       uid: uid,
     );
   }
+
   @override
   void initState() {
     super.initState();
     AppLogger.log(event: "Attendance Form Opened", uid: user!.uid);
+    _protect();
 
     if (!kIsWeb) {
       Future.microtask(() async {
@@ -1178,6 +1337,30 @@ class _AttendanceFormState extends State<AttendanceForm> {
     _checkAttendance();
     _checkExemptionStatus();
     _checkNoPunchInDay();
+    _loadVersion();
+  }
+  Future<void> _loadVersion() async {
+    final info = await PackageInfo.fromPlatform();
+    setState(() {
+      _appVersion = "v${info.version}+${info.buildNumber}";
+    });
+  }
+  Future<void> _protect() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    await user.reload();
+
+    if (!user.emailVerified) {
+      await FirebaseAuth.instance.signOut();
+      if (!mounted) return;
+
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(builder: (_) => const AuthPage()),
+            (_) => false,
+      );
+    }
   }
 
   @override
@@ -1301,16 +1484,31 @@ class _AttendanceFormState extends State<AttendanceForm> {
                 ListTile(
                   leading: const Icon(Icons.logout, color: Colors.red),
                   title: const Text("Logout"),
-                  onTap: () {
-                    AppLogger.log(event: "user logged out! ", uid: user!.uid);
-                    FirebaseAuth.instance.signOut();
-                    Navigator.pop(context);
-                    Navigator.push(
+                  trailing: Text(
+                    _appVersion,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey,
+                    ),
+                  ),
+                  onTap: () async {
+                    final uid = FirebaseAuth.instance.currentUser?.uid;
+
+                    AppLogger.log(
+                      event: "User logged out",
+                      uid: uid,
+                    );
+
+                    await FirebaseAuth.instance.signOut();
+
+                    if (!context.mounted) return;
+
+                    Navigator.pushAndRemoveUntil(
                       context,
                       MaterialPageRoute(builder: (_) => const AuthPage()),
+                          (route) => false,
                     );
                   },
-                 // onTap: () => FirebaseAuth.instance.signOut(),
                 ),
               ],
             ),
@@ -1437,13 +1635,19 @@ class _AttendanceFormState extends State<AttendanceForm> {
                                       const SizedBox(height: 8),
                                       buildSelfiePreview(false), // Punch In
                                       const SizedBox(height: 4),
-                                      if (_punchInAddress.isNotEmpty)
+                                      if (_punchInAddress != null && _punchInAddress!.trim().isNotEmpty)
                                         Text(
                                           "📍 Address: $_punchInAddress",
                                           style: const TextStyle(
                                             fontSize: 12,
                                             color: Colors.grey,
                                           ),
+                                          textAlign: TextAlign.center,
+                                        )
+                                      else
+                                        const Text(
+                                          "📍 Address: Location not captured, Please retry",
+                                          style: TextStyle(color: Colors.red),
                                           textAlign: TextAlign.center,
                                         ),
                                     ],
@@ -1615,13 +1819,19 @@ class _AttendanceFormState extends State<AttendanceForm> {
                                       const SizedBox(height: 8),
                                       buildSelfiePreview(true), // Punch Out
                                       const SizedBox(height: 4),
-                                      if (_punchOutAddress.isNotEmpty)
+                                      if (_punchOutAddress != null && _punchOutAddress!.trim().isNotEmpty)
                                         Text(
                                           "📍 Address: $_punchOutAddress",
                                           style: const TextStyle(
                                             fontSize: 12,
                                             color: Colors.grey,
                                           ),
+                                          textAlign: TextAlign.center,
+                                        )
+                                      else
+                                        const Text(
+                                          "📍 Address: Location not captured, Please retry",
+                                          style: TextStyle(color: Colors.red),
                                           textAlign: TextAlign.center,
                                         ),
                                     ],

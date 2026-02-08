@@ -6,8 +6,8 @@ import 'attendance_form.dart'; // your home page
 import 'logger.dart';
 
 class EmailVerificationPage extends StatefulWidget {
-  final User user;
-  const EmailVerificationPage({required this.user, super.key});
+  //final User user;
+  const EmailVerificationPage({super.key});
 
   @override
   State<EmailVerificationPage> createState() => _EmailVerificationPageState();
@@ -22,15 +22,21 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
 
     try {
       // Refresh user data
-      await widget.user.reload();
-      final user = FirebaseAuth.instance.currentUser!;
+      User? user = FirebaseAuth.instance.currentUser;
+      if (user == null) return;
 
-      if (user.emailVerified) {
+      await user.reload();
+      user = FirebaseAuth.instance.currentUser;
+
+      if (user!.emailVerified) {
         // Update Firestore
         await FirebaseFirestore.instance
             .collection("users")
             .doc(user.uid)
-            .update({"isEmailVerified": true});
+            .set(
+          {"isEmailVerified": true},
+          SetOptions(merge: true),
+        );
 
         AppLogger.log(
           event: "Navigate → AttendanceForm",
@@ -55,7 +61,7 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
     } catch (e) {
       AppLogger.log(
         event: "Check Verification FAILED",
-        uid: widget.user.uid,
+        uid: FirebaseAuth.instance.currentUser?.uid,
         data: {"error": e.toString()},
       );
       ScaffoldMessenger.of(context).showSnackBar(
@@ -73,9 +79,19 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
     try {
       AppLogger.log(
         event: "Resend Verification Email Clicked",
-        uid: widget.user.uid,
+        uid: FirebaseAuth.instance.currentUser?.uid,
       );
       final user = FirebaseAuth.instance.currentUser!;   // <-- IMPORTANT
+      if (user == null) {
+        AppLogger.log(
+          event: "Session expired. Please login again",
+          uid: user.uid,
+        );
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Session expired. Please login again.")),
+        );
+        return;
+      }
       await user.sendEmailVerification();
 
       AppLogger.log(
@@ -83,13 +99,13 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
         uid: user.uid,
       );
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Verification email sent.")),
+        const SnackBar(content: Text("Verification email sent. Please check spam folder")),
       );
 
     } catch (e) {
       AppLogger.log(
         event: "Resend Verification Email FAILED",
-        uid: widget.user.uid,
+        uid: FirebaseAuth.instance.currentUser?.uid,
         data: {"error": e.toString()},
       );
       ScaffoldMessenger.of(context).showSnackBar(
@@ -154,7 +170,8 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
                   ),
                   const SizedBox(height: 16),
                   const Text(
-                    "A verification link has been sent to your email.\n \n "
+                    "A verification link has been sent to your email\n \n "
+                    "Please check spam folder \n\n"
                         "Please click the link to verify your account.",
                     textAlign: TextAlign.center,
                     style: TextStyle(fontSize: 16, color: Colors.black87),
@@ -167,7 +184,7 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
                       onPressed: _loading ? null : () async {
                         AppLogger.log(
                           event: "Pressed: I have verified",
-                          uid: widget.user.uid,
+                          uid: FirebaseAuth.instance.currentUser?.uid,
                         );
                         await checkVerification();
                       },
