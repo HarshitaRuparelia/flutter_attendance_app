@@ -14,15 +14,22 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'attendance_history_screen.dart';
 import 'auth_page.dart';
 import 'leave_screen.dart';
+import 'leave_balance_screen.dart';
 import 'dart:io' show File;
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'camera_screen_wrapper.dart';
 import 'logger.dart';
+import 'utils/attendance_utils.dart';
 
 // Notifications plugin (Mobile only)
 import 'notification_service.dart';
 import 'package:timezone/timezone.dart' as tz;
+
+import 'ope_claim_screen.dart';
+import 'clock_hours_screen.dart';
+import 'utils/clock_time_utils.dart';
+import 'route_observer.dart';
 
 class AttendanceForm extends StatefulWidget {
   const AttendanceForm({super.key});
@@ -31,7 +38,7 @@ class AttendanceForm extends StatefulWidget {
   State<AttendanceForm> createState() => _AttendanceFormState();
 }
 
-class _AttendanceFormState extends State<AttendanceForm> {
+class _AttendanceFormState extends State<AttendanceForm> with RouteAware {
   File? _punchInImage;
   File? _punchOutImage;
   String? _punchInAddress;
@@ -41,13 +48,23 @@ class _AttendanceFormState extends State<AttendanceForm> {
   String? address;
   final User? user = FirebaseAuth.instance.currentUser;
   bool _alreadySubmitted = false;
+  bool _submittingPunchIn = false;
+  bool _submittingPunchOut = false;
   DateTime? _submittedTime; // Punch In
   DateTime? _punchOutTime; // Punch Out
   bool _isLate = false;
   String _totalHours = "";
+  int? _storedTotalMinutes;
   bool _exemptionRequested = false;
   bool _noPunchInNeeded = false;
+  bool _clockHoursBlockPunchIn = false;
+  String? _clockHoursBlockMessage;
+  DateTime? _pendingClockDate;
+  bool _todayClockHoursPending = false;
   String? _message;
+
+  bool get _isClockHoursBlocking => _clockHoursBlockPunchIn == true;
+  bool get _isTodayClockPending => _todayClockHoursPending == true;
   Uint8List? _punchInImageBytes;
   Uint8List? _punchOutImageBytes;
   bool _isPreviewLoading = false;
@@ -141,6 +158,82 @@ class _AttendanceFormState extends State<AttendanceForm> {
         _message = reason;
       });
     }
+  }
+
+  Future<void> _checkClockHoursCompliance() async {
+    if (user == null) return;
+
+    try {
+      final result = await checkPunchInClockCompliance(user!.uid);
+      final today = DateTime.now();
+      final todayDate = DateTime(today.year, today.month, today.day);
+      final todayStatus = await getClockDayStatus(
+        employeeId: user!.uid,
+        date: todayDate,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _clockHoursBlockPunchIn = !result.canPunchIn;
+        _clockHoursBlockMessage = result.message;
+        _pendingClockDate = result.pendingDate;
+        _todayClockHoursPending =
+            isClockHoursTrackingActive(todayDate) &&
+            todayStatus.hasPunchOut &&
+            !todayStatus.isComplete;
+      });
+    } catch (e) {
+      AppLogger.log(
+        event: "_checkClockHoursCompliance ERROR: $e",
+        uid: user?.uid,
+      );
+      if (!mounted) return;
+      setState(() {
+        _clockHoursBlockPunchIn = false;
+        _clockHoursBlockMessage = null;
+        _pendingClockDate = null;
+        _todayClockHoursPending = false;
+      });
+    }
+  }
+
+  Future<void> _openClockHours({DateTime? workDate}) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ClockHoursScreen(
+          initialWorkDate: workDate ?? _pendingClockDate,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    await _refreshAfterClockHoursChange();
+  }
+
+  Future<void> _refreshAfterClockHoursChange() async {
+    await _checkClockHoursCompliance();
+    await _checkAttendance();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route is PageRoute) {
+      appRouteObserver.subscribe(this, route);
+    }
+  }
+
+  @override
+  void didPopNext() {
+    _refreshAfterClockHoursChange();
+  }
+
+  @override
+  void dispose() {
+    appRouteObserver.unsubscribe(this);
+    _exemptionReasonController.dispose();
+    super.dispose();
   }
 
   Future<void> _captureSelfie({required bool isPunchOut}) async {
@@ -469,14 +562,27 @@ class _AttendanceFormState extends State<AttendanceForm> {
     final today = DateTime.now();
     final todayDate = DateTime(today.year, today.month, today.day);
 
-    final snap = await FirebaseFirestore.instance
-        .collection("attendance")
-        .where("userId", isEqualTo: user?.uid)
-        .where("punchInDate", isEqualTo: todayDate)
-        .get();
+    DocumentSnapshot<Map<String, dynamic>>? doc =
+        await AttendanceUtils.docRefForDay(
+      FirebaseFirestore.instance,
+      user!.uid,
+      todayDate,
+    ).get();
 
-    if (snap.docs.isNotEmpty) {
-      final data = snap.docs.first.data();
+    if (!doc.exists) {
+      final snap = await FirebaseFirestore.instance
+          .collection("attendance")
+          .where("userId", isEqualTo: user?.uid)
+          .where("punchInDate", isEqualTo: todayDate)
+          .limit(1)
+          .get();
+      if (snap.docs.isNotEmpty) {
+        doc = snap.docs.first;
+      }
+    }
+
+    if (doc != null && doc.exists) {
+      final data = doc.data()!;
       if (!mounted) return;
 
       setState(() {
@@ -495,18 +601,18 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
         // TOTAL HOURS LOGIC
         if (_punchOutTime == null) {
-          // 👈 user has not punched out
           _totalHours = "-";
+          _storedTotalMinutes = null;
         } else {
-          // 👇 Use DB stored minutes safely
-          int? mins = data["totalHours"];
+          final mins = AttendanceUtils.parseStoredMinutes(data["totalHours"]);
           if (mins != null) {
-            _totalHours = "${mins ~/ 60}h ${mins % 60}m";
+            _storedTotalMinutes = mins;
+            _totalHours = AttendanceUtils.formatMinutes(mins);
           } else {
-            // fallback (rare)
             final duration = _punchOutTime!.difference(_submittedTime!);
             final roundedMins = (duration.inSeconds / 60).round();
-            _totalHours = "${roundedMins ~/ 60}h ${roundedMins % 60}m";
+            _storedTotalMinutes = roundedMins;
+            _totalHours = AttendanceUtils.formatMinutes(roundedMins);
           }
         }
 
@@ -522,6 +628,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
         uid: user!.uid,
       );
     }
+    await _checkClockHoursCompliance();
   }
 
   Future<void> _checkExemptionStatus() async {
@@ -566,133 +673,182 @@ class _AttendanceFormState extends State<AttendanceForm> {
   }
 
   Future<void> _punchIn() async {
-    AppLogger.log(
-      event: "_punchIn() called",
-      uid: user?.uid,
-    );
-    if (!await hasInternet()) {
-      AppLogger.log(event: "Internet is required to punch in", uid: user?.uid);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Internet is required to punch in"),
-        ),
-      );
+    if (_submittingPunchIn || _loading || _alreadySubmitted) {
       return;
     }
 
-    if (!await validateDeviceTime()) {
-      AppLogger.log(
-        event: "Incorrect date & time detected. Please enable Automatic Date & Time.",
-        uid: user?.uid,
-        data: {
-          "currentTime": FieldValue.serverTimestamp(),
-          "detectedDeviceTime": DateTime.now(),
-        },
-      );
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            "Incorrect date & time detected.\nPlease enable Automatic Date & Time.",
-          ),
-        ),
-      );
-      return;
-    }
-
-    if (!_isLocationValid ||
-        (!kIsWeb && _punchInImage == null) ||
-        (kIsWeb && _punchInImageBytes == null) ||
-        _position == null) {
-      AppLogger.log(
-        event: "PunchIn failed - selfie or location missing",
-        uid: user?.uid,
-        data: {
-          "hasImage": kIsWeb
-              ? _punchInImageBytes != null
-              : _punchInImage != null,
-          "hasLocation": _position != null,
-        },
-      );
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Please take selfie & location")),
-      );
-      return;
-    }
-
-    if (_punchInAddress == null || _punchInAddress!.trim().isEmpty) {
-      AppLogger.log(
-        event: "Location not captured. Please retry with stable internet.",
-        uid: user?.uid,
-      );
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            "Location not captured.\nPlease retry with stable internet.",
-          ),
-        ),
-      );
-      return;
-    }
-
-    if (_punchInCaptureTime == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Please capture selfie first")),
-      );
-      return;
-    }
-    final captureTime = _punchInCaptureTime!;
-
-    /// 🔒 Rule 1: Punch-in allowed only after 9:00 AM (based on selfie time)
-
-    DateTime allowedTime = DateTime(captureTime.year, captureTime.month, captureTime.day, 9, 0);
-    if (captureTime.isBefore(allowedTime)) {
-      AppLogger.log(
-        event: "Punch In allowed only after 9:00 AM",
-        uid: user?.uid,
-        data: {
-          "currentTime": captureTime.toString(),
-          "allowedTime": allowedTime.toString(),
-        },
-      );
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Punch In allowed only after 9:00 AM")),
-      );
-      return;
-    }
-
-    /// 🔒 Rule 2: Button click must be within 2 minutes
-    final diff =
-        DateTime.now().difference(captureTime).inSeconds;
-    AppLogger.log(event: "punchin Diff in secs-> $diff", uid: user?.uid);
-    if (diff > 120) {
-      AppLogger.log(
-          event: "Punch In must be done within 2 minutes of selfie capture. Please re-capture selfie",
-          uid: user?.uid,
-        data: {
-          "currentTime": FieldValue.serverTimestamp(),
-          "captureTime": captureTime.toString(),
-        },
-      );
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            "Punch In must be done within 2 minutes of selfie capture.\nPlease re-capture selfie",
-          ),
-        ),
-      );
-      return;
-    }
-
-    setState(() => _loading = true);
+    _submittingPunchIn = true;
+    if (mounted) setState(() => _loading = true);
 
     try {
-      String selfieUrl = "";
+      AppLogger.log(
+        event: "_punchIn() called",
+        uid: user!.uid,
+      );
 
-      final userName = await _getUserName(); // Fetch name from Firestore
+      if (!await hasInternet()) {
+        AppLogger.log(event: "Internet is required to punch in", uid: user?.uid);
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Internet is required to punch in"),
+          ),
+        );
+        return;
+      }
+
+      if (!await validateDeviceTime()) {
+        AppLogger.log(
+          event: "Incorrect date & time detected. Please enable Automatic Date & Time.",
+          uid: user?.uid,
+          data: {
+            "currentTime": FieldValue.serverTimestamp(),
+            "detectedDeviceTime": DateTime.now(),
+          },
+        );
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              "Incorrect date & time detected.\nPlease enable Automatic Date & Time.",
+            ),
+          ),
+        );
+        return;
+      }
+
+      if (_isClockHoursBlocking) {
+        AppLogger.log(
+          event: "PunchIn blocked — clock hours pending",
+          uid: user?.uid,
+          data: {"message": _clockHoursBlockMessage},
+        );
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              _clockHoursBlockMessage ??
+                  'Please log clock hours for your previous working day first.',
+            ),
+            action: SnackBarAction(
+              label: 'Clock Hours',
+              onPressed: () => _openClockHours(),
+            ),
+          ),
+        );
+        return;
+      }
+
+      if (!_isLocationValid ||
+          (!kIsWeb && _punchInImage == null) ||
+          (kIsWeb && _punchInImageBytes == null) ||
+          _position == null) {
+        AppLogger.log(
+          event: "PunchIn failed - selfie or location missing",
+          uid: user?.uid,
+          data: {
+            "hasImage": kIsWeb
+                ? _punchInImageBytes != null
+                : _punchInImage != null,
+            "hasLocation": _position != null,
+          },
+        );
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Please take selfie & location")),
+        );
+        return;
+      }
+
+      if (_punchInAddress == null || _punchInAddress!.trim().isEmpty) {
+        AppLogger.log(
+          event: "Location not captured. Please retry with stable internet.",
+          uid: user?.uid,
+        );
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              "Location not captured.\nPlease retry with stable internet.",
+            ),
+          ),
+        );
+        return;
+      }
+
+      if (_punchInCaptureTime == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Please capture selfie first")),
+        );
+        return;
+      }
+      final captureTime = _punchInCaptureTime!;
+
+      final punchInDate = DateTime(
+        captureTime.year,
+        captureTime.month,
+        captureTime.day,
+      );
+
+      if (await AttendanceUtils.hasPunchInForDay(
+        firestore: FirebaseFirestore.instance,
+        userId: user!.uid,
+        date: punchInDate,
+      )) {
+        await _checkAttendance();
+        throw const AttendanceAlreadySubmittedException(
+          'You have already punched in today.',
+        );
+      }
+
+      DateTime allowedTime =
+          DateTime(captureTime.year, captureTime.month, captureTime.day, 9, 0);
+      if (captureTime.isBefore(allowedTime)) {
+        AppLogger.log(
+          event: "Punch In allowed only after 9:00 AM",
+          uid: user?.uid,
+          data: {
+            "currentTime": captureTime.toString(),
+            "allowedTime": allowedTime.toString(),
+          },
+        );
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Punch In allowed only after 9:00 AM")),
+        );
+        return;
+      }
+
+      final diff = DateTime.now().difference(captureTime).inSeconds;
+      AppLogger.log(event: "punchin Diff in secs-> $diff", uid: user?.uid);
+      if (diff > 120) {
+        AppLogger.log(
+          event:
+              "Punch In must be done within 2 minutes of selfie capture. Please re-capture selfie",
+          uid: user?.uid,
+          data: {
+            "currentTime": FieldValue.serverTimestamp(),
+            "captureTime": captureTime.toString(),
+          },
+        );
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              "Punch In must be done within 2 minutes of selfie capture.\nPlease re-capture selfie",
+            ),
+          ),
+        );
+        return;
+      }
+
+      String selfieUrl = "";
+      final userName = await _getUserName();
       final formattedDate =
           "${captureTime.year}-${captureTime.month}-${captureTime.day}_${captureTime.hour}-${captureTime.minute}";
 
@@ -705,17 +861,15 @@ class _AttendanceFormState extends State<AttendanceForm> {
           event: "Uploading punch-in selfie (web)",
           uid: user?.uid,
         );
-
-        // ✅ Upload web bytes directly
         await ref.putData(_punchInImageBytes!);
         selfieUrl = await ref.getDownloadURL();
       } else {
-        // ✅ Compress only on mobile
         final compressedSelfie = await compressImage(_punchInImage!);
-        if (compressedSelfie == null)
+        if (compressedSelfie == null) {
           throw Exception("Image compression failed");
+        }
 
-        File file = File(compressedSelfie.path);
+        final file = File(compressedSelfie.path);
         await ref.putFile(file);
         selfieUrl = await ref.getDownloadURL();
       }
@@ -724,21 +878,41 @@ class _AttendanceFormState extends State<AttendanceForm> {
         uid: user?.uid,
         data: {"selfieUrl": selfieUrl},
       );
-      /// 🔒 Late logic based on selfie time
-      DateTime cutoff = DateTime(captureTime.year, captureTime.month, captureTime.day, 10, 15);
-      bool isLate = captureTime.isAfter(cutoff);
 
-      await FirebaseFirestore.instance.collection("attendance").add({
-        "userId": user?.uid,
-        "punchInLatitude": _position!.latitude,
-        "punchInLongitude": _position!.longitude,
-        "punchInAddress": _punchInAddress,
-        "punchInTime": captureTime,
-        "punchInSubmittedAt": FieldValue.serverTimestamp(), // audit
-        "punchInDate": DateTime(captureTime.year, captureTime.month, captureTime.day),
-        "punchInSelfieUrl": selfieUrl,
-        "isLate": isLate,
-        'punchOutTime': null,
+      final cutoff = DateTime(
+        captureTime.year,
+        captureTime.month,
+        captureTime.day,
+        10,
+        15,
+      );
+      final isLate = captureTime.isAfter(cutoff);
+      final docRef = AttendanceUtils.docRefForDay(
+        FirebaseFirestore.instance,
+        user!.uid,
+        punchInDate,
+      );
+
+      await FirebaseFirestore.instance.runTransaction((transaction) async {
+        final existing = await transaction.get(docRef);
+        if (existing.exists && existing.data()?['punchInTime'] != null) {
+          throw const AttendanceAlreadySubmittedException(
+            'You have already punched in today.',
+          );
+        }
+
+        transaction.set(docRef, {
+          "userId": user!.uid,
+          "punchInLatitude": _position!.latitude,
+          "punchInLongitude": _position!.longitude,
+          "punchInAddress": _punchInAddress,
+          "punchInTime": Timestamp.fromDate(captureTime),
+          "punchInSubmittedAt": FieldValue.serverTimestamp(),
+          "punchInDate": punchInDate,
+          "punchInSelfieUrl": selfieUrl,
+          "isLate": isLate,
+          'punchOutTime': null,
+        });
       });
 
       setState(() {
@@ -749,11 +923,18 @@ class _AttendanceFormState extends State<AttendanceForm> {
 
       AppLogger.log(
         event: "Punch In successful",
-        uid: user?.uid,
+        uid: user!.uid,
       );
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text("Punch In successful ✅")));
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Punch In successful ✅")),
+      );
+    } on AttendanceAlreadySubmittedException catch (e) {
+      await _checkAttendance();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.message)),
+      );
     } catch (e) {
       AppLogger.log(
         event: "PunchIn ERROR",
@@ -762,12 +943,14 @@ class _AttendanceFormState extends State<AttendanceForm> {
           "error": e.toString(),
         },
       );
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text("Error: $e")));
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Error: $e")),
+      );
+    } finally {
+      _submittingPunchIn = false;
+      if (mounted) setState(() => _loading = false);
     }
-
-    setState(() => _loading = false);
   }
 
   Future<void> _punchOut() async {
@@ -775,6 +958,11 @@ class _AttendanceFormState extends State<AttendanceForm> {
       event: "_punchOut() called",
       uid: user?.uid,
     );
+
+    if (_submittingPunchOut || _loading || _punchOutTime != null) {
+      return;
+    }
+
     if (!await hasInternet()) {
       AppLogger.log(
           event: "Internet is required to punch out",
@@ -879,6 +1067,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
       return;
     }
 
+    _submittingPunchOut = true;
     setState(() => _loading = true);
 
     try {
@@ -916,49 +1105,89 @@ class _AttendanceFormState extends State<AttendanceForm> {
         data: {"selfieUrl": selfieUrl},
       );
 
-      final todayDate = DateTime(captureTime.year, captureTime.month, captureTime.day);
+      final todayDate = DateTime(
+        captureTime.year,
+        captureTime.month,
+        captureTime.day,
+      );
+      final docRef = AttendanceUtils.docRefForDay(
+        FirebaseFirestore.instance,
+        user!.uid,
+        todayDate,
+      );
 
-      final snap = await FirebaseFirestore.instance
-          .collection("attendance")
-          .where("userId", isEqualTo: user?.uid)
-          .where("punchInDate", isEqualTo: todayDate)
-          .get();
-
-      if (snap.docs.isNotEmpty) {
-       // DateTime punchOutTime = captureTime;
-        final totalHours = captureTime.difference(_submittedTime!);
-
-        final int minutes = (totalHours.inSeconds / 60).round();
-
-        await FirebaseFirestore.instance
+      DocumentReference<Map<String, dynamic>> targetRef = docRef;
+      final preCheck = await docRef.get();
+      if (!preCheck.exists) {
+        final snap = await FirebaseFirestore.instance
             .collection("attendance")
-            .doc(snap.docs.first.id)
-            .update({
-              "punchOutTime": captureTime,  // selfie captured time
-              "punchOutSubmittedAt": FieldValue.serverTimestamp(), // punch out button click time, real time
-              "punchOutSelfieUrl": selfieUrl,
-              "punchOutLatitude": _position!.latitude,
-              "punchOutLongitude": _position!.longitude,
-              "punchOutAddress": _punchOutAddress,
-              "totalHours": minutes,
-            });
-
-        setState(() {
-          _punchOutTime = captureTime;
-          _totalHours = "${totalHours.inHours}h ${totalHours.inMinutes % 60}m";
-        });
-        AppLogger.log(
-          event: "PunchOut SUCCESS",
-          uid: user?.uid,
-          data: {
-            "totalHoursFormatted": _totalHours,
-            "minutes": minutes,
-          },
-        );
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text("Punch Out successful ✅")));
+            .where("userId", isEqualTo: user!.uid)
+            .where("punchInDate", isEqualTo: todayDate)
+            .limit(1)
+            .get();
+        if (snap.docs.isEmpty) {
+          throw Exception('No punch-in record found for today.');
+        }
+        targetRef = snap.docs.first.reference;
       }
+
+      final int minutes =
+          (captureTime.difference(_submittedTime!).inSeconds / 60).round();
+
+      await FirebaseFirestore.instance.runTransaction((transaction) async {
+        final existing = await transaction.get(targetRef);
+        if (!existing.exists) {
+          throw Exception('No punch-in record found for today.');
+        }
+        if (existing.data()?['punchOutTime'] != null) {
+          throw const AttendanceAlreadyPunchedOutException(
+            'You have already punched out today.',
+          );
+        }
+
+        transaction.update(targetRef, {
+          "punchOutTime": Timestamp.fromDate(captureTime),
+          "punchOutSubmittedAt": FieldValue.serverTimestamp(),
+          "punchOutSelfieUrl": selfieUrl,
+          "punchOutLatitude": _position!.latitude,
+          "punchOutLongitude": _position!.longitude,
+          "punchOutAddress": _punchOutAddress,
+          "totalHours": minutes,
+        });
+      });
+
+      setState(() {
+        _punchOutTime = captureTime;
+        _storedTotalMinutes = minutes;
+        _totalHours = AttendanceUtils.formatMinutes(minutes);
+      });
+      AppLogger.log(
+        event: "PunchOut SUCCESS",
+        uid: user?.uid,
+        data: {
+          "totalHoursFormatted": _totalHours,
+          "minutes": minutes,
+        },
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(
+        SnackBar(
+          content: const Text("Punch Out successful ✅"),
+          action: SnackBarAction(
+            label: 'Clock Hours',
+            onPressed: () => _openClockHours(workDate: todayDate),
+          ),
+        ),
+      );
+      await _checkClockHoursCompliance();
+    } on AttendanceAlreadyPunchedOutException catch (e) {
+      await _checkAttendance();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.message)),
+      );
     } catch (e) {
       AppLogger.log(
         event: "PunchOut ERROR",
@@ -966,12 +1195,14 @@ class _AttendanceFormState extends State<AttendanceForm> {
         data: {"error": e.toString()},
       );
 
+      if (!mounted) return;
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text("Error: $e")));
+    } finally {
+      _submittingPunchOut = false;
+      if (mounted) setState(() => _loading = false);
     }
-
-    setState(() => _loading = false);
   }
 
   void _showExemptionDialog() {
@@ -1040,27 +1271,33 @@ class _AttendanceFormState extends State<AttendanceForm> {
         _submittedTime!.day,
       );
 
-      final attendanceSnap = await FirebaseFirestore.instance
-          .collection("attendance")
-          .where("userId", isEqualTo: user.uid)
-          .where("punchInDate", isEqualTo: todayDate)
-          .limit(1)
-          .get();
+      final attendanceSnap = await AttendanceUtils.docRefForDay(
+        FirebaseFirestore.instance,
+        user.uid,
+        todayDate,
+      ).get();
 
-      if (attendanceSnap.docs.isEmpty) {
-        AppLogger.log(
-          event: "Exemption Request Failed - No attendance record found for today",
-          uid: user.uid,
-        );
-        return;
+      DocumentReference<Map<String, dynamic>>? attendanceRef;
+      if (attendanceSnap.exists) {
+        attendanceRef = attendanceSnap.reference;
+      } else {
+        final legacySnap = await FirebaseFirestore.instance
+            .collection("attendance")
+            .where("userId", isEqualTo: user.uid)
+            .where("punchInDate", isEqualTo: todayDate)
+            .limit(1)
+            .get();
+        if (legacySnap.docs.isEmpty) {
+          AppLogger.log(
+            event: "Exemption Request Failed - No attendance record found for today",
+            uid: user.uid,
+          );
+          return;
+        }
+        attendanceRef = legacySnap.docs.first.reference;
       }
 
-          final docId = attendanceSnap.docs.first.id;
-
-          await FirebaseFirestore.instance
-              .collection("attendance")
-              .doc(docId)
-              .update({
+      await attendanceRef.update({
             "exemptionStatus": "requested",
             "exemptionRequestedAt": Timestamp.now(),
             "exemptionReason": reason,
@@ -1337,6 +1574,7 @@ class _AttendanceFormState extends State<AttendanceForm> {
     _checkAttendance();
     _checkExemptionStatus();
     _checkNoPunchInDay();
+    _checkClockHoursCompliance();
     _loadVersion();
   }
   Future<void> _loadVersion() async {
@@ -1361,12 +1599,6 @@ class _AttendanceFormState extends State<AttendanceForm> {
             (_) => false,
       );
     }
-  }
-
-  @override
-  void dispose() {
-    _exemptionReasonController.dispose();
-    super.dispose();
   }
 
   Widget _exemptionButton(String exemptionStatus) {
@@ -1401,17 +1633,11 @@ class _AttendanceFormState extends State<AttendanceForm> {
     final today = DateTime.now();
     final todayDate = DateTime(today.year, today.month, today.day);
 
-    return FirebaseFirestore.instance
-        .collection("attendance")
-        .where("userId", isEqualTo: user!.uid)
-        .where("punchInDate", isEqualTo: todayDate)
-        .limit(1)
-        .snapshots()
-        .map(
-          (snapshot) => snapshot.docs.isNotEmpty ? snapshot.docs.first : null,
-        )
-        .where((doc) => doc != null)
-        .cast<DocumentSnapshot<Map<String, dynamic>>>();
+    return AttendanceUtils.docRefForDay(
+      FirebaseFirestore.instance,
+      user!.uid,
+      todayDate,
+    ).snapshots().where((snap) => snap.exists);
   }
 
   @override
@@ -1477,6 +1703,45 @@ class _AttendanceFormState extends State<AttendanceForm> {
                       context,
                       MaterialPageRoute(builder: (_) => const LeaveScreen()),
                     );
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(
+                    Icons.event_available,
+                    color: Colors.orange,
+                  ),
+                  title: const Text("Leave Balance"),
+                  onTap: () {
+                    Navigator.pop(context);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const LeaveBalanceScreen(),
+                      ),
+                    );
+                  },
+                ),
+
+                ListTile(
+                  leading: const Icon(Icons.receipt_long, color: Colors.orange),
+                  title: const Text("OPE Claims"),
+                  onTap: () {
+                    Navigator.pop(context);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const OpeClaimScreen(),
+                      ),
+                    );
+                  },
+                ),
+
+                ListTile(
+                  leading: const Icon(Icons.schedule, color: Colors.orange),
+                  title: const Text("Clock Hours"),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _openClockHours();
                   },
                 ),
 
@@ -1548,6 +1813,120 @@ class _AttendanceFormState extends State<AttendanceForm> {
                                         fontSize: 14,
                                         color: Colors.orange,
                                         fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+
+                      if (_isClockHoursBlocking && !_noPunchInNeeded)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 8,
+                          ),
+                          child: Card(
+                            color: Colors.red.shade50,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            elevation: 2,
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Icon(
+                                        Icons.schedule,
+                                        color: Colors.red.shade700,
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Text(
+                                          _clockHoursBlockMessage ??
+                                              'Log clock hours for your previous working day before punching in.',
+                                          style: TextStyle(
+                                            fontSize: 14,
+                                            color: Colors.red.shade800,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 10),
+                                  SizedBox(
+                                    width: double.infinity,
+                                    child: ElevatedButton.icon(
+                                      onPressed: () => _openClockHours(),
+                                      icon: const Icon(Icons.schedule),
+                                      label: const Text('Open Clock Hours'),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.red.shade700,
+                                        foregroundColor: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+
+                      if (_isTodayClockPending &&
+                          !_noPunchInNeeded &&
+                          !_isClockHoursBlocking)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 8,
+                          ),
+                          child: Card(
+                            color: Colors.amber.shade50,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            elevation: 2,
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Row(
+                                    children: [
+                                      Icon(
+                                        Icons.warning_amber,
+                                        color: Colors.orange,
+                                      ),
+                                      SizedBox(width: 10),
+                                      Expanded(
+                                        child: Text(
+                                          'You punched out today. Please log clock hours for today.',
+                                          style: TextStyle(
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 10),
+                                  SizedBox(
+                                    width: double.infinity,
+                                    child: ElevatedButton.icon(
+                                      onPressed: () => _openClockHours(
+                                        workDate: DateTime.now(),
+                                      ),
+                                      icon: const Icon(Icons.schedule),
+                                      label: const Text('Log today\'s hours'),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.orangeAccent,
+                                        foregroundColor: Colors.black,
                                       ),
                                     ),
                                   ),
@@ -1663,151 +2042,126 @@ class _AttendanceFormState extends State<AttendanceForm> {
                                   Text( _punchOutTime != null ? "Punch Out: ${DateFormat( 'dd MMM, hh:mm a').format( _punchOutTime!)}" : "Punch Out: Not yet",
                                   ), ], ),
 
-                                // ✅ Calculate total working hours
                                 Builder(
                                   builder: (context) {
-                                    if (_submittedTime != null &&
-                                        _punchOutTime != null) {
-                                      final duration = _punchOutTime!
-                                          .difference(
-                                        _submittedTime!,
-                                      );
-                                      final totalMinutes = (duration.inSeconds /
-                                          60)
-                                          .round();
-                                      final hours = totalMinutes ~/ 60;
-                                      final minutes = totalMinutes % 60;
-                                      final totalHours =
-                                          "$hours h ${minutes
-                                          .toString()
-                                          .padLeft(2, '0')} m";
-
-                                      return Column(
-                                        crossAxisAlignment: CrossAxisAlignment
-                                            .start,
-                                        children: [
-                                          const SizedBox(height: 8),
-
-                                          FutureBuilder<DocumentSnapshot?>(
-                                            future: () async {
-                                              final snap = await FirebaseFirestore
-                                                  .instance
-                                                  .collection("attendance")
-                                                  .where(
-                                                "userId",
-                                                isEqualTo: user?.uid,
-                                              )
-                                                  .where(
-                                                "punchInDate",
-                                                isEqualTo: DateTime(
-                                                  _submittedTime!.year,
-                                                  _submittedTime!.month,
-                                                  _submittedTime!.day,
-                                                ),
-                                              )
-                                                  .limit(1)
-                                                  .get();
-
-                                              if (snap.docs.isNotEmpty) {
-                                                return snap.docs.first.reference
-                                                    .get();
-                                              }
-                                              return null;
-                                            }(),
-                                            builder: (context, snapshot) {
-                                              String exemptionStatus = "none";
-                                              if (snapshot.hasData &&
-                                                  snapshot.data != null &&
-                                                  snapshot.data!.exists &&
-                                                  snapshot.data!.data() !=
-                                                      null) {
-                                                final docData =
-                                                snapshot.data!.data()
-                                                as Map<String, dynamic>;
-                                                exemptionStatus =
-                                                    docData["exemptionStatus"] ??
-                                                        "none";
-                                              }
-
-                                              final bool isExemptApproved =
-                                                  exemptionStatus == "approved";
-                                              final bool isShortDay = hours < 9;
-
-                                              // DECIDE TEXT
-                                              String displayText = isExemptApproved
-                                                  ? totalHours
-                                                  : (isShortDay
-                                                  ? "$totalHours (Half Day)"
-                                                  : totalHours);
-
-                                              // DECIDE COLOR
-                                              Color textColor = isExemptApproved
-                                                  ? Colors.green
-                                                  : (isShortDay
-                                                  ? Colors.red
-                                                  : Colors.black);
-
-                                              // DECIDE ICON
-                                              Icon icon = Icon(
-                                                isExemptApproved
-                                                    ? Icons
-                                                    .verified_user // GREEN approved
-                                                    : Icons.access_time_filled,
-                                                color: isExemptApproved
-                                                    ? Colors.green
-                                                    : Colors.red,
-                                                size: 18,
-                                              );
-
-                                              return Column(
-                                                crossAxisAlignment:
-                                                CrossAxisAlignment.start,
-                                                children: [
-                                                  Row(
-                                                    children: [
-                                                      Text(
-                                                        "Total Hours: ",
-                                                        style: TextStyle(
-                                                          fontWeight: FontWeight
-                                                              .bold,
-                                                        ),
-                                                      ),
-
-                                                      if (isShortDay ||
-                                                          isExemptApproved)
-                                                        Padding(
-                                                          padding:
-                                                          const EdgeInsets.only(
-                                                            left: 6,
-                                                          ),
-                                                          child: icon,
-                                                        ),
-
-                                                      Text(
-                                                        " $displayText",
-                                                        style: TextStyle(
-                                                          fontWeight: FontWeight
-                                                              .bold,
-                                                          fontSize: 15,
-                                                          color: textColor,
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ),
-
-                                                  if (isShortDay) ...[
-                                                    const SizedBox(height: 8),
-                                                    _exemptionButton(
-                                                        exemptionStatus),
-                                                  ],
-                                                ],
-                                              );
-                                            },
-                                          ),
-                                        ],
-                                      );
+                                    if (_submittedTime == null ||
+                                        _punchOutTime == null ||
+                                        _storedTotalMinutes == null) {
+                                      return const SizedBox.shrink();
                                     }
-                                    return const SizedBox.shrink();
+
+                                    final totalMinutes = _storedTotalMinutes!;
+                                    final totalHours =
+                                        AttendanceUtils.formatMinutes(
+                                      totalMinutes,
+                                    );
+
+                                    return Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        const SizedBox(height: 8),
+                                        FutureBuilder<DocumentSnapshot?>(
+                                          future: AttendanceUtils.docRefForDay(
+                                            FirebaseFirestore.instance,
+                                            user!.uid,
+                                            DateTime(
+                                              _submittedTime!.year,
+                                              _submittedTime!.month,
+                                              _submittedTime!.day,
+                                            ),
+                                          ).get(),
+                                          builder: (context, snapshot) {
+                                            String exemptionStatus = "none";
+                                            if (snapshot.hasData &&
+                                                snapshot.data != null &&
+                                                snapshot.data!.exists &&
+                                                snapshot.data!.data() != null) {
+                                              final docData = snapshot
+                                                  .data!.data()
+                                                  as Map<String, dynamic>;
+                                              exemptionStatus =
+                                                  docData["exemptionStatus"] ??
+                                                      "none";
+                                            }
+
+                                            final bool isExemptApproved =
+                                                exemptionStatus == "approved";
+                                            final bool isShortDay =
+                                                totalMinutes <
+                                                    AttendanceUtils
+                                                        .fullDayMinutes &&
+                                                !isExemptApproved;
+
+                                            final String displayText =
+                                                isExemptApproved
+                                                    ? totalHours
+                                                    : (isShortDay
+                                                        ? "$totalHours (Half Day)"
+                                                        : totalHours);
+
+                                            final Color textColor =
+                                                isExemptApproved
+                                                    ? Colors.green
+                                                    : (isShortDay
+                                                        ? Colors.red
+                                                        : Colors.black);
+
+                                            final Icon icon = Icon(
+                                              isExemptApproved
+                                                  ? Icons.verified_user
+                                                  : Icons.access_time_filled,
+                                              color: isExemptApproved
+                                                  ? Colors.green
+                                                  : Colors.red,
+                                              size: 18,
+                                            );
+
+                                            return Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Row(
+                                                  children: [
+                                                    const Text(
+                                                      "Total Hours: ",
+                                                      style: TextStyle(
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                    if (isShortDay ||
+                                                        isExemptApproved)
+                                                      Padding(
+                                                        padding:
+                                                            const EdgeInsets
+                                                                .only(
+                                                          left: 6,
+                                                        ),
+                                                        child: icon,
+                                                      ),
+                                                    Text(
+                                                      " $displayText",
+                                                      style: TextStyle(
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                        fontSize: 15,
+                                                        color: textColor,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                                if (isShortDay) ...[
+                                                  const SizedBox(height: 8),
+                                                  _exemptionButton(
+                                                      exemptionStatus),
+                                                ],
+                                              ],
+                                            );
+                                          },
+                                        ),
+                                      ],
+                                    );
                                   },
                                 ),
 
@@ -1854,7 +2208,10 @@ class _AttendanceFormState extends State<AttendanceForm> {
                                   SizedBox(
                                     width: double.infinity,
                                     child: ElevatedButton(
-                                      onPressed: (_loading || _isPreviewLoading)
+                                      onPressed: (_loading ||
+                                              _isPreviewLoading ||
+                                              _isClockHoursBlocking ||
+                                              _submittingPunchIn)
                                           ? null
                                           : _punchIn,
                                       child: _loading
@@ -1878,7 +2235,9 @@ class _AttendanceFormState extends State<AttendanceForm> {
                                   SizedBox(
                                     width: double.infinity,
                                     child: ElevatedButton(
-                                      onPressed: (_loading || _isPreviewLoading)
+                                      onPressed: (_loading ||
+                                              _isPreviewLoading ||
+                                              _submittingPunchOut)
                                           ? null
                                           : _punchOut,
                                       child: _loading

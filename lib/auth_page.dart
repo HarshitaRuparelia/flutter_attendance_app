@@ -61,6 +61,8 @@ class _AuthPageState extends State<AuthPage> {
         "name": name,
         "createdAt": FieldValue.serverTimestamp(),
         "isTestUser": false,
+        "isActive": true,
+        "resignedDate": null,
       });
       AppLogger.log(event: "Signup Success and mail sent ", uid: user.uid, data: {
         "email": email,

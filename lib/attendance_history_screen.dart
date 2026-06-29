@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
+import 'utils/attendance_utils.dart';
+import 'utils/employee_attendance_summary.dart';
 
 class AttendanceHistoryScreen extends StatefulWidget {
   const AttendanceHistoryScreen({super.key});
@@ -82,62 +84,86 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
       return;
     }
 
-    // Query attendance in the range (we fetch all then filter by punchInTime)
+    final rangeStart = DateTime(
+      _startDate!.year,
+      _startDate!.month,
+      _startDate!.day,
+    );
+    final rangeEnd = DateTime(
+      _endDate!.year,
+      _endDate!.month,
+      _endDate!.day,
+      23,
+      59,
+      59,
+    );
+
+    final userDoc = await FirebaseFirestore.instance
+        .collection('users')
+        .doc(userId)
+        .get();
+    final employee = employeeProfileFromUserDoc(userDoc);
+
     final attSnap = await FirebaseFirestore.instance
         .collection('attendance')
         .where('userId', isEqualTo: userId)
-        .orderBy('punchInTime', descending: false)
-        .get();
-
-    // Query leaves that intersect the date range
-    final leaveSnap = await FirebaseFirestore.instance
-        .collection('leaves')
-        .where('userId', isEqualTo: userId)
-        .where('startDate', isLessThanOrEqualTo: Timestamp.fromDate(_endDate!))
+        .where('punchInTime', isLessThanOrEqualTo: Timestamp.fromDate(rangeEnd))
         .where(
-          'endDate',
-          isGreaterThanOrEqualTo: Timestamp.fromDate(_startDate!),
+          'punchInTime',
+          isGreaterThanOrEqualTo: Timestamp.fromDate(rangeStart),
         )
         .get();
 
+    final leaveSnap = await FirebaseFirestore.instance
+        .collection('leaves')
+        .where('userId', isEqualTo: userId)
+        .where('startDate', isLessThanOrEqualTo: Timestamp.fromDate(rangeEnd))
+        .where(
+          'endDate',
+          isGreaterThanOrEqualTo: Timestamp.fromDate(rangeStart),
+        )
+        .get();
+
+    final holidaySnap = await FirebaseFirestore.instance
+        .collection('holidays')
+        .where('date', isGreaterThanOrEqualTo: Timestamp.fromDate(rangeStart))
+        .where('date', isLessThanOrEqualTo: Timestamp.fromDate(rangeEnd))
+        .get();
+
+    final attendanceRecords = attendanceRecordsFromSnapshot(attSnap);
+    final leaveRecords = leaveRecordsFromSnapshot(leaveSnap);
+    final holidayRecords = holidayRecordsFromSnapshot(holidaySnap);
+    final holidayDateKeys = buildHolidayDateKeys(holidayRecords);
+
+    final totalMins = calculateWorkedMinutesInRange(
+      userId: userId,
+      employee: employee,
+      rangeStart: rangeStart,
+      rangeEnd: _endDate!,
+      attendanceRecords: attendanceRecords,
+      leaveRecords: leaveRecords,
+      holidayDateKeys: holidayDateKeys,
+    );
+
     final List<Map<String, dynamic>> combined = [];
 
-    // Attendance filtering and convert totalHours to int safely
-    int totalMins = 0;
-    for (var doc in attSnap.docs) {
-      final data = Map<String, dynamic>.from(doc.data());
-      final punchInTs = data['punchInTime'] as Timestamp?;
-      if (punchInTs == null) continue;
-      final punchIn = punchInTs.toDate();
-
-      // include if inside range (inclusive)
-      if (!punchIn.isBefore(
-            DateTime(_startDate!.year, _startDate!.month, _startDate!.day),
-          ) &&
-          !punchIn.isAfter(
-            DateTime(
-              _endDate!.year,
-              _endDate!.month,
-              _endDate!.day,
-            ).add(const Duration(days: 1)),
-          )) {
-        data['type'] = 'Attendance';
-        // ensure totalHours/mins is numeric int
-        final totalVal = data['totalHours'];
-        int mins = 0;
-        if (totalVal != null) {
-          if (totalVal is num)
-            mins = totalVal.toInt();
-          else if (totalVal is String)
-            mins = int.tryParse(totalVal) ?? 0;
-        }
-        data['totalHours'] = mins;
-        totalMins += mins;
-        combined.add(data);
+    for (final data in attendanceRecords) {
+      if (!attendanceOverlapsRange(data, rangeStart, rangeEnd)) continue;
+      if (!isEmployeeVisibleOnDate(employee, 
+          AttendanceUtils.parseRecordDate(data) ?? rangeStart)) {
+        continue;
       }
+
+      final row = Map<String, dynamic>.from(data);
+      row['type'] = 'Attendance';
+
+      final punchOut = row['punchOutTime'];
+      final rawMins = AttendanceUtils.parseStoredMinutes(row['totalHours']) ?? 0;
+      row['totalHours'] = punchOut != null ? rawMins : 0;
+
+      combined.add(row);
     }
 
-    // Leaves: add one row per leave (it may span multiple days; we can show start date)
     for (var doc in leaveSnap.docs) {
       final data = Map<String, dynamic>.from(doc.data());
       data['type'] = 'Leave';
@@ -215,16 +241,9 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
 
   // Convert minutes to “X hr Y min” format
   String _formatTotalHours(dynamic totalMinutes) {
-    if (totalMinutes == null) return "-";
-
-    final double mins = totalMinutes is int
-        ? totalMinutes.toDouble()
-        : double.tryParse(totalMinutes.toString()) ?? 0.0;
-
-    final int hrs = mins ~/ 60;
-    final int remMins = (mins % 60).round(); // ceil rounds up
-
-    return "$hrs h ${remMins.toString().padLeft(2, '0')} m";
+    return AttendanceUtils.formatMinutes(
+      AttendanceUtils.parseStoredMinutes(totalMinutes),
+    );
   }
 
 
@@ -483,16 +502,15 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
                                     bool isHalfDay = false;
 
                                     if (punchOut == null) {
-                                      totalHoursStr = "-"; // user has not punched out
+                                      totalHoursStr = "-";
                                     } else {
-                                      int mins = 0;
-
-                                      if (data['totalHours'] != null) {
-                                        mins = (data['totalHours'] as num).toInt();
-                                      }
-
+                                      final mins =
+                                          AttendanceUtils.parseStoredMinutes(
+                                                data['totalHours'],
+                                              ) ??
+                                              0;
                                       totalHoursStr = _formatTotalHours(mins);
-                                      isHalfDay = mins < 540; // 9 hours
+                                      isHalfDay = mins < AttendanceUtils.fullDayMinutes;
                                     }
 
 

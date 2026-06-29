@@ -1,8 +1,10 @@
 import 'package:attendance_app_new/splash_screen.dart';
 import 'package:attendance_app_new/web_entry.dart';
+import 'package:attendance_app_new/route_observer.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart'; // <-- IMPORTANT FOR kIsWeb
+import 'package:media_store_plus/media_store_plus.dart';
 import 'firebase_options.dart';
 import 'notification_service.dart';
 
@@ -12,7 +14,11 @@ void main() async {
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
-  //AppLogger.log(event: "App Launched");
+
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    await MediaStore.ensureInitialized();
+    MediaStore.appFolder = 'TaxTeckAMS';
+  }
 
   // 🟠 Initialize notifications ONLY on mobile
   if (!kIsWeb) {
@@ -34,7 +40,8 @@ class _MyAppState extends State<MyApp> {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-        home: kIsWeb ? const WebEntry() : const SplashScreen(),
+      navigatorObservers: [appRouteObserver],
+      home: kIsWeb ? const WebEntry() : const SplashScreen(),
     );
   }
 }
